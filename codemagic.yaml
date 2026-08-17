@@ -1,0 +1,55 @@
+workflows:
+  ios-release:
+    name: K-Waiter iOS Release
+    instance_type: mac_mini_m2
+
+    environment:
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.microsolution.kwaiter3
+
+      vars:
+        XCODE_WORKSPACE: "ios/App/App.xcworkspace"
+        XCODE_SCHEME: "App"
+
+      node: 22
+
+    scripts:
+      - name: Install dependencies
+        script: |
+          npm ci
+
+      - name: Build web application
+        script: |
+          npm run build
+
+      - name: Sync Capacitor iOS
+        script: |
+          npx cap sync ios
+
+      - name: Fix iOS SPM paths
+        script: |
+          node scripts/fix-ios-spm-paths.mjs
+
+      - name: Install CocoaPods dependencies
+        script: |
+          cd ios/App
+          pod install
+
+      - name: Build iOS application
+        script: |
+          xcodebuild \
+            -workspace "$XCODE_WORKSPACE" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath build/KWaiter.xcarchive \
+            archive
+
+    artifacts:
+      - build/KWaiter.xcarchive
+
+    publishing:
+      email:
+        recipients:
+          - waterprogramming98@gmail.com
