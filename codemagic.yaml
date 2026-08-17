@@ -1,9 +1,16 @@
 workflows:
   ios-release:
-    name: K-Waiter iOS Release
+    name: K-Waiter 3 iOS Release
+
+    max_build_duration: 120
+
     instance_type: mac_mini_m2
 
     environment:
+      xcode: latest
+      cocoapods: default
+      node: 22
+
       ios_signing:
         distribution_type: app_store
         bundle_identifier: com.microsolution.kwaiter3
@@ -12,14 +19,13 @@ workflows:
         XCODE_WORKSPACE: "ios/App/App.xcworkspace"
         XCODE_SCHEME: "App"
 
-      node: 22
-
     scripts:
-      - name: Install dependencies
+
+      - name: Install npm dependencies
         script: |
           npm ci
 
-      - name: Build web application
+      - name: Build Vue web application
         script: |
           npm run build
 
@@ -27,29 +33,23 @@ workflows:
         script: |
           npx cap sync ios
 
-      - name: Fix iOS SPM paths
-        script: |
-          node scripts/fix-ios-spm-paths.mjs
-
       - name: Install CocoaPods dependencies
         script: |
           cd ios/App
           pod install
 
-      - name: Build iOS application
+      - name: Set up iOS code signing
         script: |
-          xcodebuild \
-            -workspace "$XCODE_WORKSPACE" \
-            -scheme "$XCODE_SCHEME" \
-            -configuration Release \
-            -sdk iphoneos \
-            -archivePath build/KWaiter.xcarchive \
-            archive
+          xcode-project use-profiles
+
+      - name: Build iOS IPA
+        script: |
+          xcode-project build-ipa \
+            --workspace "$CM_BUILD_DIR/$XCODE_WORKSPACE" \
+            --scheme "$XCODE_SCHEME"
 
     artifacts:
-      - build/KWaiter.xcarchive
-
-    publishing:
-      email:
-        recipients:
-          - waterprogramming98@gmail.com
+      - ios/App/build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.app
+      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
