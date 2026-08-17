@@ -6,20 +6,19 @@ workflows:
 
     instance_type: mac_mini_m2
 
-    integrations:
-      app_store_connect: Codemagic K-Waiter
-
     environment:
       xcode: latest
       cocoapods: default
       node: 22
 
       ios_signing:
-        distribution_type: app_store
-        bundle_identifier: com.microsolution.kwaiter3
+        provisioning_profiles:
+          - K_WAITER_APP_STORE
+        certificates:
+          - K-Waiter Apple Distribution
 
       vars:
-        XCODE_WORKSPACE: "App.xcworkspace"
+        XCODE_WORKSPACE: "ios/App/App.xcworkspace"
         XCODE_SCHEME: "App"
 
     scripts:
@@ -47,9 +46,8 @@ workflows:
 
       - name: Build iOS IPA
         script: |
-          cd ios/App
           xcode-project build-ipa \
-            --workspace "$XCODE_WORKSPACE" \
+            --workspace "$CM_BUILD_DIR/$XCODE_WORKSPACE" \
             --scheme "$XCODE_SCHEME"
 
     artifacts:
@@ -57,7 +55,3 @@ workflows:
       - /tmp/xcodebuild_logs/*.log
       - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.app
       - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
-
-    publishing:
-      app_store_connect:
-        auth: integration
