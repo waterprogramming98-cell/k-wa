@@ -4,11 +4,12 @@ import { useRouter } from 'vue-router';
 import { useAuthStore } from '@/app/stores/auth';
 import { useConnectivityStore } from '@/app/stores/connectivity';
 import { useSettingsStore } from '@/app/stores/settings';
+import { useCatalogStore } from '@/app/stores/catalog';
 import { appPreferences } from '@/app/services/preferences';
 import { normalizeDeviceSettings } from '@/app/settings/defaults';
 import { waiterApi } from '@/app/services/waiter-api';
 import { isDirectPrintingMode, pairedBluetoothPrinters, requestCashDrawerOpen, testDirectPrinter, validateDirectPrinter } from '@/app/services/direct-printing';
-import type { DeviceSettings, Printer } from '@/shared/domain';
+import type { DeviceSettings, LocalNetworkPrinter, Printer } from '@/shared/domain';
 import type { ReceiptSnapshot } from '@/shared/domain';
 import { localDatabase } from '@/app/services/local-database';
 import { belongsToActiveScope } from '@/app/services/data-scope';
@@ -23,6 +24,7 @@ const router = useRouter();
 const auth = useAuthStore();
 const connectivity = useConnectivityStore();
 const settingsStore = useSettingsStore();
+const catalog = useCatalogStore();
 const tab = ref<Tab>('general');
 const draft = ref<DeviceSettings>(normalizeDeviceSettings(settingsStore.settings));
 const serverUrl = ref('');
@@ -36,6 +38,10 @@ const bluetoothLoading = ref(false);
 const showUnlock = ref(false);
 const managerPassword = ref('');
 const unlocking = ref(false);
+const showLocalPrinter = ref(false);
+const editingLocalPrinterId = ref<string | null>(null);
+const localPrinterBusyId = ref<string | null>(null);
+const localPrinterForm = ref<LocalNetworkPrinter>(emptyLocalPrinter());
 const canManage = computed(() => auth.permissions.can_manage_device || settingsStore.unlocked);
 
 const tabs: Array<{ id: Tab; label: string; icon: string }> = [
@@ -61,6 +67,98 @@ const paymentOptions = computed(() => normalizePaymentOptions(draft.value.paymen
 const enabledPaymentCount = computed(() => paymentOptions.value.filter(option => !draft.value.payment.hiddenMethods.includes(option.id)).length);
 const receiptPrinters = computed(() => printers.value.filter(item => item.active && item.printReceipt));
 const drawerPrinters = computed(() => printers.value.filter(item => item.active && item.cashDrawer?.enabled));
+const localReceiptPrinters = computed(() => draft.value.printing.localPrinters.filter(item => item.active && item.printReceipt));
+const localDrawerPrinters = computed(() => draft.value.printing.localPrinters.filter(item => item.active && item.cashDrawer.enabled));
+const availableFallbackPrinters = computed(() => draft.value.printing.localPrinters.filter(item => item.id !== editingLocalPrinterId.value));
+
+function emptyLocalPrinter(): LocalNetworkPrinter {
+  return {
+    id: globalThis.crypto?.randomUUID?.() ?? `local-printer-${Date.now()}`,
+    name: '', host: '', port: 9100, paperWidth: 80, active: true,
+    printReceipt: false, printKot: true, department: 'kitchen', categoryIds: [], fallbackPrinterId: null,
+    cashDrawer: { enabled: false, pin: 0, onMs: 120, offMs: 240 },
+    buzzer: { enabled: false, mode: 'bel', count: 1, duration: 2 },
+  };
+}
+
+function cloneLocalPrinter(printer: LocalNetworkPrinter): LocalNetworkPrinter {
+  return {
+    ...printer,
+    categoryIds: [...printer.categoryIds],
+    cashDrawer: { ...printer.cashDrawer },
+    buzzer: { ...printer.buzzer },
+  };
+}
+
+function openLocalPrinterForm(printer?: LocalNetworkPrinter): void {
+  editingLocalPrinterId.value = printer?.id ?? null;
+  localPrinterForm.value = printer ? cloneLocalPrinter(printer) : emptyLocalPrinter();
+  showLocalPrinter.value = true;
+  error.value = '';
+}
+
+function closeLocalPrinterForm(): void {
+  showLocalPrinter.value = false;
+  editingLocalPrinterId.value = null;
+}
+
+function toggleLocalPrinterCategory(categoryId: number): void {
+  const selected = new Set(localPrinterForm.value.categoryIds);
+  if (selected.has(categoryId)) selected.delete(categoryId); else selected.add(categoryId);
+  localPrinterForm.value.categoryIds = Array.from(selected);
+}
+
+function saveLocalPrinter(): void {
+  const printer = localPrinterForm.value;
+  const host = printer.host.trim();
+  const name = printer.name.trim();
+  if (!name) { error.value = 'أدخل اسم الطابعة المحلية.'; return; }
+  if (!host || host.length > 253 || !/^[a-zA-Z0-9.:-]+$/.test(host)) { error.value = 'أدخل IP صحيحًا للطابعة المحلية.'; return; }
+  if (!Number.isInteger(printer.port) || printer.port < 1 || printer.port > 65535) { error.value = 'منفذ الطابعة غير صالح.'; return; }
+  if (!printer.printReceipt && !printer.printKot && !printer.cashDrawer.enabled) { error.value = 'حدد مهمة واحدة للطابعة على الأقل.'; return; }
+  if (draft.value.printing.localPrinters.some(item => item.id !== printer.id && item.host === host && item.port === printer.port)) {
+    error.value = 'هذه الطابعة مضافة بالفعل بنفس IP والمنفذ.'; return;
+  }
+  const savedPrinter: LocalNetworkPrinter = { ...cloneLocalPrinter(printer), name, host };
+  const index = draft.value.printing.localPrinters.findIndex(item => item.id === savedPrinter.id);
+  if (index >= 0) draft.value.printing.localPrinters.splice(index, 1, savedPrinter);
+  else draft.value.printing.localPrinters.push(savedPrinter);
+  if (savedPrinter.active && savedPrinter.printReceipt && !draft.value.printing.localReceiptPrinterId) draft.value.printing.localReceiptPrinterId = savedPrinter.id;
+  if ((!savedPrinter.active || !savedPrinter.printReceipt) && draft.value.printing.localReceiptPrinterId === savedPrinter.id) {
+    draft.value.printing.localReceiptPrinterId = draft.value.printing.localPrinters.find(item => item.id !== savedPrinter.id && item.active && item.printReceipt)?.id ?? null;
+  }
+  if (savedPrinter.active && savedPrinter.cashDrawer.enabled && !draft.value.printing.localCashDrawerPrinterId) draft.value.printing.localCashDrawerPrinterId = savedPrinter.id;
+  if ((!savedPrinter.active || !savedPrinter.cashDrawer.enabled) && draft.value.printing.localCashDrawerPrinterId === savedPrinter.id) {
+    draft.value.printing.localCashDrawerPrinterId = draft.value.printing.localPrinters.find(item => item.id !== savedPrinter.id && item.active && item.cashDrawer.enabled)?.id ?? null;
+  }
+  const primary = draft.value.printing.localPrinters.find(item => item.id === draft.value.printing.localReceiptPrinterId) ?? savedPrinter;
+  draft.value.printing.directHost = primary.host;
+  draft.value.printing.directPort = primary.port;
+  draft.value.printing.paperWidth = primary.paperWidth;
+  error.value = '';
+  closeLocalPrinterForm();
+}
+
+function removeLocalPrinter(printer: LocalNetworkPrinter): void {
+  if (!window.confirm(`حذف الطابعة «${printer.name}» من هذا التابلت؟`)) return;
+  draft.value.printing.localPrinters = draft.value.printing.localPrinters.filter(item => item.id !== printer.id)
+    .map(item => item.fallbackPrinterId === printer.id ? { ...item, fallbackPrinterId: null } : item);
+  if (draft.value.printing.localReceiptPrinterId === printer.id) {
+    draft.value.printing.localReceiptPrinterId = draft.value.printing.localPrinters.find(item => item.active && item.printReceipt)?.id ?? null;
+  }
+  if (draft.value.printing.localCashDrawerPrinterId === printer.id) {
+    draft.value.printing.localCashDrawerPrinterId = draft.value.printing.localPrinters.find(item => item.active && item.cashDrawer.enabled)?.id ?? null;
+  }
+}
+
+async function testLocalPrinter(printer: LocalNetworkPrinter): Promise<void> {
+  localPrinterBusyId.value = printer.id; error.value = ''; printerMessage.value = '';
+  try {
+    await testDirectPrinter(draft.value.printing, printer);
+    printerMessage.value = `تمت طباعة الاختبار على ${printer.name} — ${printer.host}:${printer.port}`;
+  } catch (reason) { error.value = reason instanceof Error ? reason.message : 'فشل اختبار الطابعة المحلية'; }
+  finally { localPrinterBusyId.value = null; }
+}
 function paymentEnabled(method: string): boolean { return !draft.value.payment.hiddenMethods.includes(method); }
 function togglePayment(method: string): void {
   const hidden = new Set(draft.value.payment.hiddenMethods);
@@ -77,6 +175,7 @@ onMounted(async () => {
   serverUrl.value = await appPreferences.getServerUrl();
   const shift = await waiterApi.shift().catch(() => null);
   if (shift?.paymentMethodOptions?.length) draft.value.payment.knownMethods = normalizePaymentOptions(shift.paymentMethodOptions);
+  if (!catalog.categories.length) await catalog.load().catch(() => undefined);
 });
 
 watch([tab, () => draft.value.printing.mode], async ([value, mode]) => {
@@ -111,6 +210,7 @@ async function save(): Promise<void> {
   error.value = ''; saved.value = false;
   try {
     if (!enabledPaymentCount.value) throw new Error('يجب تفعيل طريقة دفع واحدة على الأقل.');
+    if (draft.value.printing.enabled && draft.value.printing.mode === 'tcp' && !localReceiptPrinters.value.length) throw new Error('أضف طابعة محلية مفعلة للفاتورة وحددها كطابعة رئيسية.');
     if (draft.value.printing.enabled && isDirectPrintingMode(draft.value.printing.mode)) validateDirectPrinter(draft.value.printing);
     await settingsStore.save(draft.value);
     saved.value = true; window.setTimeout(() => { saved.value = false; }, 2500);
@@ -162,9 +262,10 @@ async function testPrinter(): Promise<void> {
   try {
     if (isDirectPrintingMode(draft.value.printing.mode)) {
       await testDirectPrinter(draft.value.printing);
+      const primaryLocal = draft.value.printing.localPrinters.find(item => item.id === draft.value.printing.localReceiptPrinterId);
       printerMessage.value = draft.value.printing.mode === 'bluetooth'
         ? `تمت الطباعة عبر Bluetooth على ${draft.value.printing.bluetoothName || draft.value.printing.bluetoothAddress}`
-        : `تمت الطباعة مباشرة على ${draft.value.printing.directHost}:${draft.value.printing.directPort}`;
+        : `تمت الطباعة مباشرة على ${primaryLocal?.name || 'الطابعة الرئيسية'} — ${primaryLocal?.host || draft.value.printing.directHost}:${primaryLocal?.port || draft.value.printing.directPort}`;
       return;
     }
     if (draft.value.printing.mode === 'airprint') {
@@ -278,7 +379,23 @@ async function logout(): Promise<void> {
           <div v-if="draft.printing.mode === 'server'" class="managed-note">التابلت يرسل مهمة الطباعة إلى Laravel، ويقوم Print Agent الموجود على كمبيوتر الفرع بطباعتها. يحتاج الوصول إلى السيرفر.</div>
           <template v-else-if="draft.printing.mode === 'tcp'">
             <div class="managed-note success-note">اتصال محلي مباشر: يعمل بدون إنترنت وبدون كمبيوتر، بشرط أن يكون التابلت والطابعة على نفس شبكة Wi‑Fi.</div>
-            <div class="form-grid"><label class="field"><span>IP الطابعة</span><input v-model.trim="draft.printing.directHost" inputmode="decimal" placeholder="192.168.1.50" autocapitalize="off" autocorrect="off" /></label><label class="field"><span>Port</span><input v-model.number="draft.printing.directPort" type="number" min="1" max="65535" inputmode="numeric" placeholder="9100" /></label><label class="field"><span>مقاس الورق</span><select v-model.number="draft.printing.paperWidth"><option :value="80">80 mm</option><option :value="58">58 mm</option></select></label><label class="field"><span>مهلة الاتصال</span><select v-model.number="draft.printing.connectionTimeoutMs"><option :value="3000">3 ثوانٍ</option><option :value="5000">5 ثوانٍ</option><option :value="8000">8 ثوانٍ</option></select></label></div>
+            <div class="local-printer-toolbar">
+              <div><h3>طابعات هذا التابلت</h3><p class="muted">{{ draft.printing.localPrinters.length }} طابعة محفوظة محليًا على الجهاز</p></div>
+              <button type="button" class="btn btn-primary" @click="openLocalPrinterForm()"><AppIcon name="plus" :size="18" /> إضافة طابعة</button>
+            </div>
+            <div v-if="!draft.printing.localPrinters.length" class="local-printer-empty"><AppIcon name="printer" :size="36" /><strong>لم تتم إضافة طابعات محلية</strong><span>أضف طابعة الفاتورة أو المطبخ أو المشروبات باستخدام IP مستقل لكل طابعة.</span></div>
+            <div v-else class="local-printer-grid">
+              <article v-for="printer in draft.printing.localPrinters" :key="printer.id" class="local-printer-card" :class="{ inactive: !printer.active }">
+                <header><span class="local-printer-icon"><AppIcon name="printer" :size="24" /></span><div class="grow"><h4>{{ printer.name }}</h4><p dir="ltr">{{ printer.host }}:{{ printer.port }} · {{ printer.paperWidth }}mm</p></div><i :class="printer.active ? 'printer-status-on' : 'printer-status-off'">{{ printer.active ? 'مفعلة' : 'متوقفة' }}</i></header>
+                <div class="printer-role-list"><span v-if="printer.printReceipt">فاتورة</span><span v-if="printer.printKot">KOT · {{ printer.department === 'beverage' ? 'مشروبات' : printer.department === 'cashier' ? 'كاشير' : printer.department === 'all' ? 'كل الأقسام' : 'مطبخ' }}</span><span v-if="printer.categoryIds.length">{{ printer.categoryIds.length }} تصنيف</span><span v-if="printer.cashDrawer.enabled">درج نقدية</span><span v-if="printer.buzzer.enabled">صوت</span></div>
+                <p v-if="printer.fallbackPrinterId" class="printer-fallback">البديلة: {{ draft.printing.localPrinters.find(item => item.id === printer.fallbackPrinterId)?.name || 'غير متاحة' }}</p>
+                <footer><button type="button" class="btn btn-secondary" :disabled="localPrinterBusyId === printer.id || !printer.active" @click="testLocalPrinter(printer)">{{ localPrinterBusyId === printer.id ? 'جاري الاختبار…' : 'اختبار' }}</button><button type="button" class="btn btn-secondary" @click="openLocalPrinterForm(printer)"><AppIcon name="edit" :size="16" /> تعديل</button><button type="button" class="icon-button danger-icon" aria-label="حذف الطابعة" @click="removeLocalPrinter(printer)"><AppIcon name="trash" :size="18" /></button></footer>
+              </article>
+            </div>
+            <div class="form-grid">
+              <label class="field"><span>طابعة الفاتورة الرئيسية</span><select v-model="draft.printing.localReceiptPrinterId"><option :value="null">اختر طابعة</option><option v-for="printer in localReceiptPrinters" :key="printer.id" :value="printer.id">{{ printer.name }} · {{ printer.host }}</option></select><small>تُستخدم للفواتير وإعادة الطباعة والطباعة بعد الدفع.</small></label>
+              <label class="field"><span>مهلة الاتصال</span><select v-model.number="draft.printing.connectionTimeoutMs"><option :value="3000">3 ثوانٍ</option><option :value="5000">5 ثوانٍ</option><option :value="8000">8 ثوانٍ</option></select></label>
+            </div>
           </template>
           <template v-else-if="draft.printing.mode === 'bluetooth'">
             <div class="managed-note success-note">يعمل بدون إنترنت وبدون كمبيوتر على Android. اقترن بالطابعة أولًا من إعدادات Bluetooth في التابلت.</div>
@@ -292,13 +409,14 @@ async function logout(): Promise<void> {
           <label class="switch-row"><span><strong>طباعة تلقائية بعد الدفع</strong><small class="muted">يطبع الفاتورة النهائية بعد نجاح التحصيل الكامل</small></span><input v-model="draft.printing.autoPrintAfterPayment" class="switch" type="checkbox" /></label>
           <div v-if="draft.printing.mode === 'airprint'" class="managed-note">AirPrint لا يحتاج Agent أو إنترنت، لكنه يعرض نافذة اختيار الطابعة والتأكيد على iPad.</div>
           <label class="field"><span>عدد نسخ الفاتورة</span><select v-model.number="draft.printing.receiptCopies"><option :value="1">نسخة واحدة</option><option :value="2">نسختان</option><option :value="3">3 نسخ</option></select></label>
-          <label v-if="receiptPrinters.length" class="field"><span>طابعة الفاتورة الرئيسية</span><select v-model.number="draft.printing.receiptPrinterId"><option :value="null">تلقائي حسب إعداد الفرع</option><option v-for="printer in receiptPrinters" :key="printer.id" :value="printer.id">{{ printer.name }} · {{ printer.department || 'الكل' }} · {{ printer.paperWidth || 80 }}mm</option></select><small class="muted">توجيه KOT للمطبخ والمشروبات يظل مستقلًا حسب قواعد الأقسام.</small></label>
+          <label v-if="draft.printing.mode === 'server' && receiptPrinters.length" class="field"><span>طابعة الفاتورة الرئيسية</span><select v-model.number="draft.printing.receiptPrinterId"><option :value="null">تلقائي حسب إعداد الفرع</option><option v-for="printer in receiptPrinters" :key="printer.id" :value="printer.id">{{ printer.name }} · {{ printer.department || 'الكل' }} · {{ printer.paperWidth || 80 }}mm</option></select><small class="muted">توجيه KOT للمطبخ والمشروبات يظل مستقلًا حسب قواعد الأقسام.</small></label>
           <div class="settings-subsection">
             <h3>درج النقدية وصوت الطابعة</h3>
             <label class="switch-row"><span><strong>تفعيل درج النقدية على هذا التابلت</strong><small class="muted">الطابعة نفسها يجب أن تكون مفعلة للدرج من إعدادات السيرفر.</small></span><input v-model="draft.printing.cashDrawerEnabled" class="switch" type="checkbox" /></label>
-            <label v-if="drawerPrinters.length" class="field"><span>طابعة درج النقدية</span><select v-model.number="draft.printing.cashDrawerPrinterId"><option :value="null">أول طابعة درج مفعلة</option><option v-for="printer in drawerPrinters" :key="printer.id" :value="printer.id">{{ printer.name }} · {{ printer.connectionType }}</option></select></label>
+            <label v-if="draft.printing.mode === 'server' && drawerPrinters.length" class="field"><span>طابعة درج النقدية</span><select v-model.number="draft.printing.cashDrawerPrinterId"><option :value="null">أول طابعة درج مفعلة</option><option v-for="printer in drawerPrinters" :key="printer.id" :value="printer.id">{{ printer.name }} · {{ printer.connectionType }}</option></select></label>
+            <label v-else-if="draft.printing.mode === 'tcp' && localDrawerPrinters.length" class="field"><span>طابعة درج النقدية</span><select v-model="draft.printing.localCashDrawerPrinterId"><option :value="null">اختر طابعة الدرج</option><option v-for="printer in localDrawerPrinters" :key="printer.id" :value="printer.id">{{ printer.name }} · {{ printer.host }}</option></select></label>
             <label class="switch-row"><span><strong>فتح الدرج تلقائيًا مع الدفع النقدي</strong><small class="muted">لا يفتح مع KNET أو إعادة طباعة الفاتورة، وكل عملية فتح تُسجل للمراجعة.</small></span><input v-model="draft.printing.cashDrawerAutoOpenCash" class="switch" type="checkbox" /></label>
-            <div class="managed-note success-note">صوت الطابعة يُضبط لكل طابعة من شاشة طابعات الفرع؛ يمكن تشغيله للمطبخ أو المشروبات أو الفاتورة بصورة مستقلة.</div>
+            <div class="managed-note success-note">{{ draft.printing.mode === 'tcp' ? 'الصوت ودرج النقدية يُضبطان بصورة مستقلة داخل كارت كل طابعة محلية.' : 'صوت الطابعة يُضبط لكل طابعة من شاشة طابعات الفرع؛ يمكن تشغيله للمطبخ أو المشروبات أو الفاتورة بصورة مستقلة.' }}</div>
             <button v-if="auth.permissions.can_open_cash_drawer" class="btn btn-secondary" :disabled="!draft.printing.cashDrawerEnabled" @click="testCashDrawer">اختبار فتح درج النقدية</button>
           </div>
           <label v-if="draft.printing.mode === 'server' && printers.length" class="field"><span>طابعة الاختبار</span><select v-model.number="printerId"><option v-for="printer in printers" :key="printer.id" :value="printer.id">{{ printer.name }}{{ printer.active ? '' : ' — متوقفة' }}</option></select></label>
@@ -314,6 +432,19 @@ async function logout(): Promise<void> {
         <header class="modal-head"><AppIcon name="lock" :size="24" /><h2>فتح إعدادات التابلت</h2><button type="button" class="icon-button" aria-label="إغلاق" @click="showUnlock = false">×</button></header>
         <div class="modal-body stack"><p>أدخل نفس كلمة مرور مدير النظام أو صاحب المنشأة. لن يتم حفظها على الجهاز.</p><label class="field"><span>كلمة مرور المدير</span><input v-model="managerPassword" type="password" autocomplete="current-password" autofocus required /></label><p v-if="error" class="error-text">{{ error }}</p></div>
         <footer class="modal-foot"><button type="button" class="btn btn-secondary" @click="showUnlock = false">إلغاء</button><button class="btn btn-primary" :disabled="unlocking || !managerPassword">{{ unlocking ? 'جاري التحقق…' : 'فتح الإعدادات' }}</button></footer>
+      </form>
+    </div>
+    <div v-if="showLocalPrinter" class="modal-backdrop" @click.self="closeLocalPrinterForm">
+      <form class="modal local-printer-modal" @submit.prevent="saveLocalPrinter">
+        <header class="modal-head"><span class="local-printer-icon"><AppIcon name="printer" :size="24" /></span><div class="grow"><h2>{{ editingLocalPrinterId ? 'تعديل الطابعة' : 'إضافة طابعة محلية' }}</h2><small class="muted">إعداد مستقل محفوظ على هذا التابلت</small></div><button type="button" class="icon-button" aria-label="إغلاق" @click="closeLocalPrinterForm"><AppIcon name="close" :size="20" /></button></header>
+        <div class="modal-body stack">
+          <div class="form-grid"><label class="field"><span>اسم الطابعة</span><input v-model.trim="localPrinterForm.name" placeholder="مثال: مطبخ رئيسي" required /></label><label class="field"><span>الحالة</span><select v-model="localPrinterForm.active"><option :value="true">مفعلة</option><option :value="false">متوقفة مؤقتًا</option></select></label><label class="field"><span>IP الطابعة</span><input v-model.trim="localPrinterForm.host" inputmode="decimal" placeholder="192.168.1.50" dir="ltr" autocapitalize="off" autocorrect="off" required /></label><label class="field"><span>Port</span><input v-model.number="localPrinterForm.port" type="number" min="1" max="65535" inputmode="numeric" placeholder="9100" required /></label><label class="field"><span>مقاس الورق</span><select v-model.number="localPrinterForm.paperWidth"><option :value="80">80 mm</option><option :value="58">58 mm</option></select></label><label class="field"><span>طابعة بديلة عند التوقف</span><select v-model="localPrinterForm.fallbackPrinterId"><option :value="null">بدون طابعة بديلة</option><option v-for="printer in availableFallbackPrinters" :key="printer.id" :value="printer.id">{{ printer.name }}</option></select></label></div>
+          <section class="printer-form-section"><h3>مهام الطابعة</h3><div class="printer-task-grid"><label class="switch-row"><span><strong>طباعة الفاتورة</strong><small class="muted">فاتورة العميل وإعادة الطباعة</small></span><input v-model="localPrinterForm.printReceipt" class="switch" type="checkbox" /></label><label class="switch-row"><span><strong>طباعة KOT</strong><small class="muted">طلبات المطبخ أو المشروبات</small></span><input v-model="localPrinterForm.printKot" class="switch" type="checkbox" /></label></div><label v-if="localPrinterForm.printKot" class="field"><span>القسم</span><select v-model="localPrinterForm.department"><option value="kitchen">المطبخ</option><option value="beverage">المشروبات</option><option value="cashier">الكاشير</option><option value="all">كل الأقسام</option></select></label><div v-if="localPrinterForm.printKot" class="field"><span>التصنيفات الموجهة لهذه الطابعة</span><small>اتركها فارغة لطباعة كل الأصناف، أو حدد تصنيفات بعينها.</small><div class="printer-category-grid"><button v-for="category in catalog.categories" :key="category.id" type="button" :class="{ active: localPrinterForm.categoryIds.includes(category.id) }" @click="toggleLocalPrinterCategory(category.id)">{{ category.name }}<AppIcon v-if="localPrinterForm.categoryIds.includes(category.id)" name="check" :size="15" /></button></div></div></section>
+          <section class="printer-form-section"><h3>الصوت عند الطباعة</h3><label class="switch-row"><span><strong>تشغيل صوت الطابعة</strong><small class="muted">مفيد لطابعة المطبخ والمشروبات</small></span><input v-model="localPrinterForm.buzzer.enabled" class="switch" type="checkbox" /></label><div v-if="localPrinterForm.buzzer.enabled" class="form-grid"><label class="field"><span>نوع الأمر</span><select v-model="localPrinterForm.buzzer.mode"><option value="bel">BEL</option><option value="esc-b">ESC B</option></select></label><label class="field"><span>عدد المرات</span><input v-model.number="localPrinterForm.buzzer.count" type="number" min="1" max="9" /></label><label class="field"><span>المدة</span><input v-model.number="localPrinterForm.buzzer.duration" type="number" min="1" max="9" /></label></div></section>
+          <section class="printer-form-section"><h3>درج النقدية</h3><label class="switch-row"><span><strong>الدرج متصل بهذه الطابعة</strong><small class="muted">يرسل أمر الفتح إلى منفذ الدرج في الطابعة</small></span><input v-model="localPrinterForm.cashDrawer.enabled" class="switch" type="checkbox" /></label><div v-if="localPrinterForm.cashDrawer.enabled" class="form-grid"><label class="field"><span>Pin</span><select v-model.number="localPrinterForm.cashDrawer.pin"><option :value="0">Pin 2</option><option :value="1">Pin 5</option></select></label><label class="field"><span>نبضة التشغيل ms</span><input v-model.number="localPrinterForm.cashDrawer.onMs" type="number" min="20" max="1000" step="10" /></label><label class="field"><span>نبضة الإيقاف ms</span><input v-model.number="localPrinterForm.cashDrawer.offMs" type="number" min="20" max="1000" step="10" /></label></div></section>
+          <p v-if="error" class="error-text">{{ error }}</p>
+        </div>
+        <footer class="modal-foot"><button type="button" class="btn btn-secondary" @click="closeLocalPrinterForm">إلغاء</button><button class="btn btn-primary"><AppIcon name="save" :size="18" /> حفظ الطابعة</button></footer>
       </form>
     </div>
   </div>

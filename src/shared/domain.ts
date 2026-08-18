@@ -313,6 +313,32 @@ export interface Printer {
   active: boolean;
 }
 
+export interface LocalNetworkPrinter {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  paperWidth: 58 | 80;
+  active: boolean;
+  printReceipt: boolean;
+  printKot: boolean;
+  department: 'kitchen' | 'beverage' | 'cashier' | 'all';
+  categoryIds: number[];
+  fallbackPrinterId: string | null;
+  cashDrawer: {
+    enabled: boolean;
+    pin: 0 | 1;
+    onMs: number;
+    offMs: number;
+  };
+  buzzer: {
+    enabled: boolean;
+    mode: 'bel' | 'esc-b';
+    count: number;
+    duration: number;
+  };
+}
+
 export interface KotPrintRoute {
   id: number;
   name: string;
@@ -415,7 +441,7 @@ export interface LocalPrintJob {
   paperWidth?: 58 | 80;
   printerMode?: 'tcp' | 'bluetooth';
   bluetoothAddress?: string;
-  printerId?: number;
+  printerId?: number | string;
   printerName?: string;
   buzzer?: { enabled: boolean; mode: 'bel' | 'esc-b'; count: number; duration: number };
 }
@@ -465,7 +491,7 @@ export interface ShiftState {
 }
 
 export interface DeviceSettings {
-  version: 3;
+  version: 4;
   deviceName: string;
   preset: 'waiter' | 'pickup' | 'cashier' | 'custom';
   language: Language;
@@ -528,6 +554,8 @@ export interface DeviceSettings {
     mode: 'server' | 'tcp' | 'bluetooth' | 'airprint';
     receiptCopies: 1 | 2 | 3;
     receiptPrinterId: number | null;
+    localReceiptPrinterId: string | null;
+    localPrinters: LocalNetworkPrinter[];
     directHost: string;
     directPort: number;
     bluetoothAddress: string;
@@ -538,6 +566,7 @@ export interface DeviceSettings {
     autoPrintAfterPayment: boolean;
     cashDrawerEnabled: boolean;
     cashDrawerPrinterId: number | null;
+    localCashDrawerPrinterId: string | null;
     cashDrawerAutoOpenCash: boolean;
     connectionTimeoutMs: 3000 | 5000 | 8000;
   };

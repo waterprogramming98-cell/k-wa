@@ -24,6 +24,24 @@ describe('direct local printing', () => {
     expect(() => validateDirectPrinter(settings.printing)).toThrow('IP الطابعة');
   });
 
+  it('keeps multiple local printers and their independent routes', () => {
+    const settings = normalizeDeviceSettings({
+      printing: {
+        mode: 'tcp',
+        localReceiptPrinterId: 'receipt',
+        localPrinters: [
+          { id: 'receipt', name: 'Receipt', host: '192.168.1.50', port: 9100, paperWidth: 80, active: true, printReceipt: true, printKot: false, department: 'cashier', categoryIds: [], fallbackPrinterId: null, cashDrawer: { enabled: true, pin: 0, onMs: 120, offMs: 240 }, buzzer: { enabled: false, mode: 'bel', count: 1, duration: 2 } },
+          { id: 'beverage', name: 'Beverage', host: '192.168.1.51', port: 9100, paperWidth: 58, active: true, printReceipt: false, printKot: true, department: 'beverage', categoryIds: [7, 8], fallbackPrinterId: 'receipt', cashDrawer: { enabled: false, pin: 0, onMs: 120, offMs: 240 }, buzzer: { enabled: true, mode: 'esc-b', count: 2, duration: 3 } },
+        ],
+      },
+    } as never);
+    expect(settings.printing.localPrinters).toHaveLength(2);
+    expect(settings.printing.localPrinters[1]?.categoryIds).toEqual([7, 8]);
+    expect(settings.printing.localPrinters[1]?.fallbackPrinterId).toBe('receipt');
+    expect(settings.printing.localPrinters[1]?.buzzer.enabled).toBe(true);
+    expect(() => validateDirectPrinter(settings.printing)).not.toThrow();
+  });
+
   it('creates an offline Arabic receipt snapshot from the saved cart', () => {
     const draft = createEmptyDraft('delivery');
     draft.updatedAt = '2026-08-14T10:00:00.000Z';

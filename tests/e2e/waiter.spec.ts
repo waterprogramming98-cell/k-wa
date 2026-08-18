@@ -289,21 +289,34 @@ test('keeps cached tables usable offline and marks local table orders', async ({
   await context.setOffline(false);
 });
 
-test('configures direct tablet printing without a print agent', async ({ page }) => {
+test('configures multiple direct tablet printers without a print agent', async ({ page }) => {
   await openExtraScreen(page, 'الإعدادات');
   await page.locator('.settings-nav').getByRole('button', { name: /الطباعة/ }).click();
   await page.getByLabel('طريقة طباعة الفاتورة').selectOption('tcp');
   await expect(page.getByText(/يعمل بدون إنترنت وبدون كمبيوتر/)).toBeVisible();
-  await page.getByLabel('IP الطابعة').fill('192.168.1.50');
-  await page.getByLabel('Port').fill('9100');
-  await page.getByLabel('مقاس الورق').selectOption('58');
+  await page.getByRole('button', { name: 'إضافة طابعة' }).click();
+  let printerModal = page.locator('.local-printer-modal');
+  await printerModal.getByLabel('اسم الطابعة').fill('طابعة الفاتورة');
+  await printerModal.getByLabel('IP الطابعة').fill('192.168.1.50');
+  await printerModal.getByLabel('Port').fill('9100');
+  await printerModal.getByLabel('مقاس الورق').selectOption('58');
+  await printerModal.getByRole('checkbox', { name: /طباعة الفاتورة/ }).check();
+  await printerModal.getByRole('checkbox', { name: /طباعة KOT/ }).uncheck();
+  await page.getByRole('button', { name: 'حفظ الطابعة' }).click();
+  await page.getByRole('button', { name: 'إضافة طابعة' }).click();
+  printerModal = page.locator('.local-printer-modal');
+  await printerModal.getByLabel('اسم الطابعة').fill('طابعة المشروبات');
+  await printerModal.getByLabel('IP الطابعة').fill('192.168.1.51');
+  await printerModal.getByLabel('القسم').selectOption('beverage');
+  await page.getByRole('button', { name: 'حفظ الطابعة' }).click();
+  await expect(page.locator('.local-printer-card')).toHaveCount(2);
   await page.getByRole('button', { name: 'حفظ الإعدادات' }).click();
   await expect(page.getByRole('button', { name: /تم الحفظ/ })).toBeVisible();
   await page.reload();
   await page.locator('.settings-nav').getByRole('button', { name: /الطباعة/ }).click();
   await expect(page.getByLabel('طريقة طباعة الفاتورة')).toHaveValue('tcp');
-  await expect(page.getByLabel('IP الطابعة')).toHaveValue('192.168.1.50');
-  await expect(page.getByLabel('مقاس الورق')).toHaveValue('58');
+  await expect(page.locator('.local-printer-card').filter({ hasText: 'طابعة الفاتورة' })).toContainText('192.168.1.50:9100');
+  await expect(page.locator('.local-printer-card').filter({ hasText: 'طابعة المشروبات' })).toContainText('192.168.1.51:9100');
   await page.getByRole('link', { name: 'نقطة البيع' }).click();
   await page.locator('.context-summary').click();
   await page.getByPlaceholder(/اكتب الاسم/).fill('محمد');

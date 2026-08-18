@@ -2,12 +2,13 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 import { appPreferences } from '@/app/services/preferences';
 import { localDatabase } from '@/app/services/local-database';
 import { receiptFromDraft, renderReceiptRaster } from '@/app/services/receipt';
-import type { DeviceSettings, KotRoutingSnapshot, LocalPrintJob, PrintJobResult, ReceiptSnapshot, SyncOperation } from '@/shared/domain';
+import type { DeviceSettings, KotRoutingSnapshot, LocalNetworkPrinter, LocalPrintJob, PrintJobResult, ReceiptSnapshot, SyncOperation } from '@/shared/domain';
 import type { OrderDraft, OrderType, ServerPrintJob } from '@/shared/domain';
 import { belongsToActiveScope, getActiveDataScope, scopedKey } from '@/app/services/data-scope';
 import { waiterApi } from '@/app/services/waiter-api';
 import { getUiLanguage } from '@/app/services/localization';
 import { selectedDrawerPrinter, selectedReceiptPrinter } from '@/app/services/printer-directory';
+import { localKotPrinters, localPrinterFallback, selectedLocalDrawerPrinter, selectedLocalReceiptPrinter } from '@/app/services/local-printers';
 import { createId } from '@/shared/ids';
 
 interface DirectPrintPlugin {
@@ -48,6 +49,25 @@ const iosPrinter = registerPlugin<DirectPrintPlugin>('KemetAirPrint');
 const MAX_ATTEMPTS_BEFORE_SLOW_RETRY = 6;
 const COMPLETED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
+function localPrinterForServerJob(settings: DeviceSettings['printing'], source: ServerPrintJob): LocalNetworkPrinter | null {
+  if (settings.mode !== 'tcp') return null;
+  if (source.jobType === 'receipt' || source.jobType === 'delivery_label') return selectedLocalReceiptPrinter(settings);
+  const activeKot = localKotPrinters(settings);
+  const sameName = activeKot.find(printer => printer.name.trim().toLocaleLowerCase() === source.printerName.trim().toLocaleLowerCase());
+  if (sameName) return sameName;
+  const serverDepartment = String(source.payload.department || '').toLocaleLowerCase();
+  const department: LocalNetworkPrinter['department'] = /bar|beverage|drink|مشروب/.test(serverDepartment)
+    ? 'beverage'
+    : /cashier|receipt|كاشير/.test(serverDepartment)
+      ? 'cashier'
+      : /kitchen|grill|مطبخ|شواية/.test(serverDepartment)
+        ? 'kitchen'
+        : 'all';
+  return activeKot.find(printer => printer.department === department)
+    ?? activeKot.find(printer => printer.department === 'all')
+    ?? null;
+}
+
 function plugin(): DirectPrintPlugin {
   if (!Capacitor.isNativePlatform()) throw new Error('الطباعة المباشرة متاحة داخل تطبيق التابلت المثبت فقط');
   return Capacitor.getPlatform() === 'ios' ? iosPrinter : androidPrinter;
@@ -58,10 +78,12 @@ export function validateDirectPrinter(settings: DeviceSettings['printing']): voi
     if (!/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/i.test(settings.bluetoothAddress.trim())) throw new Error('اختر طابعة Bluetooth مقترنة أولًا');
     return;
   }
-  const host = settings.directHost.trim();
+  const localPrinter = selectedLocalReceiptPrinter(settings);
+  const host = (localPrinter?.host || settings.directHost).trim();
+  const port = localPrinter?.port || settings.directPort;
   if (!host) throw new Error('أدخل IP الطابعة، مثال 192.168.1.50');
   if (host.length > 253 || !/^[a-zA-Z0-9.:-]+$/.test(host)) throw new Error('عنوان الطابعة غير صالح');
-  if (!Number.isInteger(settings.directPort) || settings.directPort < 1 || settings.directPort > 65535) throw new Error('منفذ الطابعة غير صالح');
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('منفذ الطابعة غير صالح');
 }
 
 function friendlyError(reason: unknown): string {
@@ -74,8 +96,9 @@ function friendlyError(reason: unknown): string {
   return message || 'فشل الاتصال بالطابعة المباشرة';
 }
 
-async function nativePrint(receipt: ReceiptSnapshot, settings: DeviceSettings['printing'], copies: number, target?: Pick<LocalPrintJob, 'printerHost' | 'printerPort' | 'paperWidth'>): Promise<void> {
-  const printTarget = target as (Pick<LocalPrintJob, 'printerHost' | 'printerPort' | 'paperWidth' | 'printerMode' | 'bluetoothAddress' | 'buzzer'> | undefined);
+type DirectPrintTarget = Pick<LocalPrintJob, 'printerHost' | 'printerPort' | 'paperWidth' | 'printerMode' | 'bluetoothAddress' | 'printerId' | 'printerName' | 'buzzer'>;
+
+async function nativePrint(receipt: ReceiptSnapshot, settings: DeviceSettings['printing'], copies: number, printTarget?: DirectPrintTarget): Promise<void> {
   const effective = {
     ...settings,
     mode: printTarget?.printerMode || settings.mode,
@@ -84,7 +107,9 @@ async function nativePrint(receipt: ReceiptSnapshot, settings: DeviceSettings['p
     paperWidth: printTarget?.paperWidth || settings.paperWidth,
     bluetoothAddress: printTarget?.bluetoothAddress || settings.bluetoothAddress,
   };
-  validateDirectPrinter(effective);
+  validateDirectPrinter(printTarget && effective.mode === 'tcp'
+    ? { ...effective, localPrinters: [], localReceiptPrinterId: null }
+    : effective);
   const imageBase64 = renderReceiptRaster(receipt, effective.paperWidth);
   if (effective.mode === 'bluetooth') {
     if (Capacitor.getPlatform() !== 'android') throw new Error('Bluetooth المباشر متاح على Android فقط؛ استخدم AirPrint أو TCP على iPad');
@@ -143,6 +168,43 @@ async function runJob(job: LocalPrintJob, settings: DeviceSettings, force = fals
     }
     return { jobIds: [], jobs: 1, local: true, queued: false, localJobId: job.id };
   } catch (reason) {
+    const sourcePrinter = typeof job.printerId === 'string'
+      ? settings.printing.localPrinters.find(item => item.id === job.printerId)
+      : undefined;
+    const fallbackPrinter = sourcePrinter ? localPrinterFallback(settings.printing, sourcePrinter) : null;
+    if (fallbackPrinter && fallbackPrinter.id !== job.printerId) {
+      try {
+        await nativePrint(job.receipt, settings.printing, job.copies, {
+          printerHost: fallbackPrinter.host,
+          printerPort: fallbackPrinter.port,
+          paperWidth: fallbackPrinter.paperWidth,
+          printerId: fallbackPrinter.id,
+          printerName: fallbackPrinter.name,
+          buzzer: fallbackPrinter.buzzer,
+        });
+        const completed = {
+          ...printing,
+          printerId: fallbackPrinter.id,
+          printerName: fallbackPrinter.name,
+          printerHost: fallbackPrinter.host,
+          printerPort: fallbackPrinter.port,
+          paperWidth: fallbackPrinter.paperWidth,
+          status: 'completed' as const,
+          completedAt: Date.now(),
+          nextAttemptAt: 0,
+          serverAckPending: Boolean(job.serverJobId),
+          lastError: `تم استخدام الطابعة البديلة بعد تعذر الاتصال بـ ${sourcePrinter?.name || 'الطابعة الأساسية'}`,
+        };
+        await saveJob(completed);
+        if (job.serverJobId) {
+          try {
+            await waiterApi.completeDirectPrint(job.serverJobId, `direct-print-complete-${job.serverJobId}`);
+            await saveJob({ ...completed, serverAckPending: false });
+          } catch { /* The fallback already printed; acknowledge later without reprinting. */ }
+        }
+        return { jobIds: [], jobs: 1, local: true, queued: false, localJobId: job.id };
+      } catch { /* Retry the original route according to the queue policy below. */ }
+    }
     const attempts = job.attempts + 1;
     const delay = attempts >= MAX_ATTEMPTS_BEFORE_SLOW_RETRY
       ? 5 * 60_000
@@ -165,7 +227,9 @@ export const directPrintQueue = {
     if (existing?.status === 'completed') return { jobIds: [], jobs: 1, local: true, queued: false, localJobId: storageId };
     if (existing?.status === 'uncertain' && !force) return { jobIds: [], jobs: 1, local: true, queued: true, localJobId: storageId };
     const settings = await appPreferences.getDeviceSettings();
-    const configuredPrinter = await selectedReceiptPrinter(settings.printing.receiptPrinterId);
+    const localPrinter = settings.printing.mode === 'tcp' ? selectedLocalReceiptPrinter(settings.printing) : null;
+    const configuredPrinter = localPrinter ? null : await selectedReceiptPrinter(settings.printing.receiptPrinterId);
+    const targetBuzzer = localPrinter?.buzzer ?? configuredPrinter?.buzzer;
     const job: LocalPrintJob = existing ?? {
       scope: getActiveDataScope(),
       id: storageId,
@@ -178,9 +242,10 @@ export const directPrintQueue = {
       printerMode: settings.printing.mode === 'bluetooth' ? 'bluetooth' : 'tcp',
       ...(settings.printing.mode === 'bluetooth'
         ? { bluetoothAddress: settings.printing.bluetoothAddress }
-        : { printerHost: configuredPrinter?.ipAddress || settings.printing.directHost, printerPort: configuredPrinter?.port || settings.printing.directPort }),
-      paperWidth: configuredPrinter?.paperWidth || settings.printing.paperWidth,
-      ...(configuredPrinter ? { printerId: configuredPrinter.id, printerName: configuredPrinter.name, ...(configuredPrinter.buzzer ? { buzzer: configuredPrinter.buzzer } : {}) } : {}),
+        : { printerHost: localPrinter?.host || configuredPrinter?.ipAddress || settings.printing.directHost, printerPort: localPrinter?.port || configuredPrinter?.port || settings.printing.directPort }),
+      paperWidth: localPrinter?.paperWidth || configuredPrinter?.paperWidth || settings.printing.paperWidth,
+      ...((localPrinter || configuredPrinter) ? { printerId: localPrinter?.id ?? configuredPrinter!.id, printerName: localPrinter?.name ?? configuredPrinter!.name } : {}),
+      ...(targetBuzzer ? { buzzer: targetBuzzer } : {}),
     };
     if (!existing) await saveJob(job);
     return runJob({ ...job, receipt, copies }, settings, force);
@@ -190,7 +255,7 @@ export const directPrintQueue = {
     receipt: ReceiptSnapshot,
     jobId: string,
     copies: 1 | 2 | 3,
-    target: { printerHost: string; printerPort: number; paperWidth: 58 | 80; printerId?: number; printerName?: string; buzzer?: LocalPrintJob['buzzer'] },
+    target: { printerHost: string; printerPort: number; paperWidth: 58 | 80; printerId?: number | string; printerName?: string; buzzer?: LocalPrintJob['buzzer'] },
   ): Promise<PrintJobResult> {
     const storageId = scopedKey(jobId);
     const existing = await localDatabase.get<LocalPrintJob>('printJobs', storageId);
@@ -272,7 +337,8 @@ export const directPrintQueue = {
     const results: PrintJobResult[] = [];
     const settings = await appPreferences.getDeviceSettings();
     for (const source of serverJobs) {
-      if (settings.printing.mode === 'tcp' && !source.printerIp) continue;
+      const localTarget = localPrinterForServerJob(settings.printing, source);
+      if (settings.printing.mode === 'tcp' && !localTarget && !source.printerIp) continue;
       const orderType = ['dine_in', 'takeaway', 'delivery', 'pickup'].includes(source.payload.order_type || '') ? source.payload.order_type as OrderType : 'takeaway';
       const contentLines = source.payload.lines ?? [];
       const items = contentLines.filter(line => line.type === 'item').map((line, index) => ({
@@ -297,10 +363,11 @@ export const directPrintQueue = {
       }
       const job: LocalPrintJob = existing ?? {
         scope: getActiveDataScope(), id: storageId, receipt, copies: source.copies, status: 'pending', attempts: 0,
-        nextAttemptAt: Date.now(), createdAt: Date.now(), serverJobId: source.id, printerHost: source.printerIp,
-        printerPort: source.printerPort, paperWidth: source.paperWidth,
-        printerName: source.printerName,
-        ...(source.buzzer ? { buzzer: source.buzzer } : {}),
+        nextAttemptAt: Date.now(), createdAt: Date.now(), serverJobId: source.id, printerHost: localTarget?.host || source.printerIp,
+        printerPort: localTarget?.port || source.printerPort, paperWidth: localTarget?.paperWidth || source.paperWidth,
+        ...(localTarget ? { printerId: localTarget.id } : {}),
+        printerName: localTarget?.name || source.printerName,
+        ...((localTarget?.buzzer || source.buzzer) ? { buzzer: localTarget?.buzzer ?? source.buzzer! } : {}),
         printerMode: settings.printing.mode === 'bluetooth' ? 'bluetooth' : 'tcp',
         ...(settings.printing.mode === 'bluetooth' ? { bluetoothAddress: settings.printing.bluetoothAddress } : {}),
       };
@@ -321,7 +388,41 @@ export const directPrintQueue = {
 
   async enqueueRoutedDraftKot(draft: OrderDraft, routing: KotRoutingSnapshot | null): Promise<PrintJobResult[]> {
     const settings = await appPreferences.getDeviceSettings();
-    if (settings.printing.mode !== 'tcp' || !routing?.routes.length) return [await this.enqueueDraftKot(draft)];
+    if (settings.printing.mode !== 'tcp') return [await this.enqueueDraftKot(draft)];
+
+    const tabletPrinters = localKotPrinters(settings.printing);
+    if (tabletPrinters.length) {
+      const localResults: PrintJobResult[] = [];
+      for (const printer of tabletPrinters) {
+        const categoryIds = new Set(printer.categoryIds);
+        const lines = categoryIds.size
+          ? draft.lines.filter(line => Boolean(line.categoryId && categoryIds.has(line.categoryId)))
+          : draft.lines;
+        if (!lines.length) continue;
+        const routedDraft: OrderDraft = { ...draft, lines };
+        const receipt = receiptFromDraft(routedDraft, { temporary: true });
+        receipt.documentType = 'kot';
+        receipt.businessName = `KOT — ${printer.name}`;
+        receipt.total = 0;
+        receipt.lines = receipt.lines.map(line => ({ ...line, unitPrice: 0, total: 0 }));
+        localResults.push(await this.enqueueTargeted(
+          receipt,
+          `offline-kot-${draft.localId}-${draft.revision}-local-${printer.id}`,
+          1,
+          {
+            printerHost: printer.host,
+            printerPort: printer.port,
+            paperWidth: printer.paperWidth,
+            printerId: printer.id,
+            printerName: printer.name,
+            buzzer: printer.buzzer,
+          },
+        ));
+      }
+      if (localResults.length) return localResults;
+    }
+
+    if (!routing?.routes.length) return [await this.enqueueDraftKot(draft)];
 
     const results: PrintJobResult[] = [];
     const routes = routing.routes
@@ -377,9 +478,10 @@ export async function checkDirectPrinterConnection(settings: DeviceSettings['pri
     if (!result.success) throw new Error(friendlyError(result.error));
     return;
   }
+  const localPrinter = selectedLocalReceiptPrinter(settings);
   const result = await plugin().testConnection({
-    host: settings.directHost.trim(),
-    port: settings.directPort,
+    host: (localPrinter?.host || settings.directHost).trim(),
+    port: localPrinter?.port || settings.directPort,
     timeout: settings.connectionTimeoutMs,
   });
   if (!result.success) throw new Error(friendlyError(result.error));
@@ -396,8 +498,12 @@ export async function pairedBluetoothPrinters(): Promise<Array<{ address: string
   return (await androidPrinter.btGetPaired()).devices;
 }
 
-export async function testDirectPrinter(settings: DeviceSettings['printing']): Promise<void> {
-  await checkDirectPrinterConnection(settings);
+export async function testDirectPrinter(settings: DeviceSettings['printing'], localPrinter?: LocalNetworkPrinter): Promise<void> {
+  if (localPrinter) {
+    await checkLocalNetworkPrinterConnection(settings, localPrinter);
+  } else {
+    await checkDirectPrinterConnection(settings);
+  }
   const now = new Date().toISOString();
   const receipt: ReceiptSnapshot = {
     scope: getActiveDataScope(),
@@ -412,13 +518,24 @@ export async function testDirectPrinter(settings: DeviceSettings['printing']): P
     temporary: false,
     lines: [{ name: getUiLanguage() === 'en' ? 'Direct Print Test' : 'اختبار الطباعة المباشرة', quantity: 1, unitPrice: 0, total: 0, choices: [getUiLanguage() === 'en' ? 'Connection Successful' : 'الاتصال ناجح'] }],
   };
-  const configured = await selectedReceiptPrinter(settings.receiptPrinterId);
-  await nativePrint(receipt, settings, 1, configured ? {
-    printerHost: configured.ipAddress || settings.directHost,
-    printerPort: configured.port || settings.directPort,
-    paperWidth: configured.paperWidth || settings.paperWidth,
-    ...(configured.buzzer ? { buzzer: configured.buzzer } : {}),
-  } as Pick<LocalPrintJob, 'printerHost' | 'printerPort' | 'paperWidth'> : undefined);
+  const localConfigured = localPrinter ?? (settings.mode === 'tcp' ? selectedLocalReceiptPrinter(settings) : null);
+  const configured = localConfigured ? null : await selectedReceiptPrinter(settings.receiptPrinterId);
+  const testBuzzer = localConfigured?.buzzer ?? configured?.buzzer;
+  const testPrinterId = localConfigured?.id ?? configured?.id;
+  const testPrinterName = localConfigured?.name ?? configured?.name;
+  await nativePrint(receipt, settings, 1, (localConfigured || configured) ? {
+    printerHost: localConfigured?.host || configured?.ipAddress || settings.directHost,
+    printerPort: localConfigured?.port || configured?.port || settings.directPort,
+    paperWidth: localConfigured?.paperWidth || configured?.paperWidth || settings.paperWidth,
+    ...(testPrinterId !== undefined ? { printerId: testPrinterId } : {}),
+    ...(testPrinterName ? { printerName: testPrinterName } : {}),
+    ...(testBuzzer ? { buzzer: testBuzzer } : {}),
+  } : undefined);
+}
+
+export async function checkLocalNetworkPrinterConnection(settings: DeviceSettings['printing'], localPrinter: LocalNetworkPrinter): Promise<void> {
+  const result = await plugin().testConnection({ host: localPrinter.host, port: localPrinter.port, timeout: settings.connectionTimeoutMs });
+  if (!result.success) throw new Error(friendlyError(result.error));
 }
 
 function uuid(): string {
@@ -436,18 +553,25 @@ export async function requestCashDrawerOpen(
   if (!settings.printing.cashDrawerEnabled) throw new Error('فتح درج النقدية متوقف من إعدادات التابلت');
   const eventUuid = uuid();
   const direct = isDirectPrintingMode(settings.printing.mode);
-  const configured = await selectedDrawerPrinter(settings.printing.cashDrawerPrinterId);
+  const localConfigured = settings.printing.mode === 'tcp' ? selectedLocalDrawerPrinter(settings.printing) : null;
+  const configured = localConfigured ? null : await selectedDrawerPrinter(settings.printing.cashDrawerPrinterId);
   let authorization: Awaited<ReturnType<typeof waiterApi.openCashDrawer>> | null = null;
 
   if (navigator.onLine) {
-    authorization = await waiterApi.openCashDrawer({
-      eventUuid,
-      printerId: configured?.id ?? settings.printing.cashDrawerPrinterId,
-      trigger: input.trigger,
-      direct,
-      ...(input.transactionId !== undefined ? { transactionId: input.transactionId } : {}),
-      ...(input.reason ? { reason: input.reason } : {}),
-    });
+    try {
+      authorization = await waiterApi.openCashDrawer({
+        eventUuid,
+        printerId: configured?.id ?? settings.printing.cashDrawerPrinterId,
+        trigger: input.trigger,
+        direct,
+        ...(input.transactionId !== undefined ? { transactionId: input.transactionId } : {}),
+        ...(input.reason ? { reason: input.reason } : {}),
+      });
+    } catch (reason) {
+      // A locally managed TCP drawer must keep working even when it has no
+      // corresponding server printer record. Its audit report is queued below.
+      if (!localConfigured) throw reason;
+    }
   } else if (!direct) {
     // A server/Agent drawer cannot be pulsed safely while offline. Automatic
     // payment actions must still complete and must not be replayed later,
@@ -460,22 +584,39 @@ export async function requestCashDrawerOpen(
 
   if (!direct) return { queued: true, eventUuid };
 
-  const drawer = authorization?.printer
+  const drawer = localConfigured
+    ? localConfigured.cashDrawer
+    : authorization?.printer
     ? { pin: authorization.printer.pin, onMs: authorization.printer.onMs, offMs: authorization.printer.offMs }
     : {
         pin: configured?.cashDrawer?.pin ?? 0,
         onMs: configured?.cashDrawer?.onMs ?? 120,
         offMs: configured?.cashDrawer?.offMs ?? 240,
       };
+  let openedLocalPrinter = localConfigured;
   try {
     if (settings.printing.mode === 'bluetooth') {
       if (Capacitor.getPlatform() !== 'android') throw new Error('فتح الدرج عبر Bluetooth متاح على Android فقط');
       await androidPrinter.btOpenCashDrawer({ address: settings.printing.bluetoothAddress, ...drawer });
     } else {
-      const host = authorization?.printer?.ipAddress || configured?.ipAddress || settings.printing.directHost;
-      const port = authorization?.printer?.port || configured?.port || settings.printing.directPort;
+      const host = localConfigured?.host || authorization?.printer?.ipAddress || configured?.ipAddress || settings.printing.directHost;
+      const port = localConfigured?.port || authorization?.printer?.port || configured?.port || settings.printing.directPort;
       if (!host) throw new Error('لم يتم تحديد IP طابعة درج النقدية');
-      await plugin().openCashDrawer({ host, port, timeout: settings.printing.connectionTimeoutMs, ...drawer });
+      try {
+        await plugin().openCashDrawer({ host, port, timeout: settings.printing.connectionTimeoutMs, ...drawer });
+      } catch (reason) {
+        const fallback = localConfigured ? localPrinterFallback(settings.printing, localConfigured) : null;
+        if (!fallback?.cashDrawer.enabled) throw reason;
+        await plugin().openCashDrawer({
+          host: fallback.host,
+          port: fallback.port,
+          timeout: settings.printing.connectionTimeoutMs,
+          pin: fallback.cashDrawer.pin,
+          onMs: fallback.cashDrawer.onMs,
+          offMs: fallback.cashDrawer.offMs,
+        });
+        openedLocalPrinter = fallback;
+      }
     }
     if (authorization) {
       await waiterApi.cashDrawerResult(eventUuid, 'opened').catch(() => undefined);
@@ -485,6 +626,7 @@ export async function requestCashDrawerOpen(
         idempotencyKey: `cash-drawer:${eventUuid}`, revision: Date.now(),
         payload: {
           eventUuid, printerId: configured?.id ?? settings.printing.cashDrawerPrinterId,
+          localPrinterName: openedLocalPrinter?.name,
           transactionId: input.transactionId, trigger: input.trigger, reason: input.reason, status: 'opened',
         },
         status: 'pending', attempts: 0, nextAttemptAt: Date.now(), createdAt: Date.now(),
