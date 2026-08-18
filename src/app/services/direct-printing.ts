@@ -449,6 +449,12 @@ export async function requestCashDrawerOpen(
       ...(input.reason ? { reason: input.reason } : {}),
     });
   } else if (!direct) {
+    // A server/Agent drawer cannot be pulsed safely while offline. Automatic
+    // payment actions must still complete and must not be replayed later,
+    // otherwise the drawer could open unexpectedly after reconnection.
+    if (input.trigger === 'cash_payment' || input.trigger === 'split_cash') {
+      return { queued: false, eventUuid };
+    }
     throw new Error('فتح الدرج عن طريق Print Agent يحتاج اتصالًا بالسيرفر');
   }
 
