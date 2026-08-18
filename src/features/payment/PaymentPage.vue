@@ -14,7 +14,7 @@ import { money } from '@/shared/format';
 import type { OrderDetail, OrderType, PaymentMethod, ShiftState } from '@/shared/domain';
 import { enabledPaymentOptions, isOfflinePaymentMethod, paymentMethodIcon, paymentMethodLabel, shiftPaymentOptions } from '@/shared/payment-methods';
 import { markReceiptPaid } from '@/app/services/receipt';
-import { directPrintQueue, isDirectPrintingMode } from '@/app/services/direct-printing';
+import { directPrintQueue, isDirectPrintingMode, requestCashDrawerOpen } from '@/app/services/direct-printing';
 import AppIcon from '@/components/AppIcon.vue';
 
 const route = useRoute();
@@ -135,6 +135,15 @@ async function pay(): Promise<void> {
         await directPrintQueue.enqueueServerJobs(paymentPrintJobs.jobData);
       }
       await operationKeys.complete('payment', orderId);
+    }
+    const includesCash = split.value
+      ? paymentParts.some(part => part.method === 'cash' && part.amount > 0)
+      : method.value === 'cash';
+    if (includesCash && settings.settings.printing.cashDrawerEnabled && settings.settings.printing.cashDrawerAutoOpenCash) {
+      await requestCashDrawerOpen(settings.settings, {
+        trigger: split.value ? 'split_cash' : 'cash_payment',
+        transactionId: orderId,
+      });
     }
     done.value = true;
     if (!partialItems.value) {

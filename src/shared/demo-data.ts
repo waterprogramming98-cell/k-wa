@@ -38,6 +38,9 @@ export const demoPermissions: PermissionSet = {
   can_manage_device: true,
   can_print: true,
   can_delete_line: true,
+  can_open_cash_drawer: true,
+  can_view_cash_drawer_log: true,
+  can_manage_printers: true,
 };
 
 export const demoCategories: Category[] = [

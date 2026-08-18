@@ -47,6 +47,9 @@ export interface PermissionSet {
   can_manage_device: boolean;
   can_print: boolean;
   can_delete_line: boolean;
+  can_open_cash_drawer: boolean;
+  can_view_cash_drawer_log: boolean;
+  can_manage_printers: boolean;
 }
 
 export interface SessionUser {
@@ -289,6 +292,24 @@ export interface Printer {
   connectionType: string;
   ipAddress?: string | null;
   port: number;
+  department?: string;
+  paperWidth?: 58 | 80;
+  printKot?: boolean;
+  printReceipt?: boolean;
+  fallbackPrinterId?: number | null;
+  cashDrawer?: {
+    enabled: boolean;
+    autoOpen: boolean;
+    pin: 0 | 1;
+    onMs: number;
+    offMs: number;
+  };
+  buzzer?: {
+    enabled: boolean;
+    mode: 'bel' | 'esc-b';
+    count: number;
+    duration: number;
+  };
   active: boolean;
 }
 
@@ -306,6 +327,8 @@ export interface KotPrintRoute {
     ipAddress: string;
     port: number;
     paperWidth: 58 | 80;
+    fallbackPrinterId?: number | null;
+    buzzer?: { enabled: boolean; mode: 'bel' | 'esc-b'; count: number; duration: number };
   };
 }
 
@@ -331,6 +354,7 @@ export interface ServerPrintJob {
   printerPort: number;
   paperWidth: 58 | 80;
   copies: 1 | 2 | 3;
+  buzzer?: { enabled: boolean; mode: 'bel' | 'esc-b'; count: number; duration: number };
   payload: { invoice_no?: string; department?: string; order_type?: string; table?: string; lines?: Array<{ type?: string; text?: string; name?: string; qty?: string | number; note?: string }> };
 }
 
@@ -391,6 +415,9 @@ export interface LocalPrintJob {
   paperWidth?: 58 | 80;
   printerMode?: 'tcp' | 'bluetooth';
   bluetoothAddress?: string;
+  printerId?: number;
+  printerName?: string;
+  buzzer?: { enabled: boolean; mode: 'bel' | 'esc-b'; count: number; duration: number };
 }
 
 export type SyncOperationKind =
@@ -402,7 +429,8 @@ export type SyncOperationKind =
   | 'customer.update'
   | 'address.create'
   | 'address.update'
-  | 'print.submit';
+  | 'print.submit'
+  | 'cash_drawer.report';
 
 export interface SyncOperation {
   scope: string;
@@ -499,6 +527,7 @@ export interface DeviceSettings {
     enabled: boolean;
     mode: 'server' | 'tcp' | 'bluetooth' | 'airprint';
     receiptCopies: 1 | 2 | 3;
+    receiptPrinterId: number | null;
     directHost: string;
     directPort: number;
     bluetoothAddress: string;
@@ -507,6 +536,9 @@ export interface DeviceSettings {
     cutPaper: boolean;
     autoPrintOnSave: boolean;
     autoPrintAfterPayment: boolean;
+    cashDrawerEnabled: boolean;
+    cashDrawerPrinterId: number | null;
+    cashDrawerAutoOpenCash: boolean;
     connectionTimeoutMs: 3000 | 5000 | 8000;
   };
 }
@@ -530,4 +562,7 @@ export const DEFAULT_PERMISSIONS: PermissionSet = {
   can_manage_device: false,
   can_print: false,
   can_delete_line: false,
+  can_open_cash_drawer: false,
+  can_view_cash_drawer_log: false,
+  can_manage_printers: false,
 };

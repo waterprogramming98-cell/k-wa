@@ -12,7 +12,7 @@ import { waiterApi } from '@/app/services/waiter-api';
 import { printDraftReceipt, printOrderBill } from '@/app/services/printing';
 import { cacheReceipt, markDraftReceiptPaid, markReceiptPaid, receiptFromDraft } from '@/app/services/receipt';
 import { createIdempotencyKey } from '@/shared/ids';
-import { directPrintQueue, isDirectPrintingMode } from '@/app/services/direct-printing';
+import { directPrintQueue, isDirectPrintingMode, requestCashDrawerOpen } from '@/app/services/direct-printing';
 import { loadKotRouting } from '@/app/services/kot-routing';
 import { plainClone } from '@/shared/clone';
 import type { CartLine, Customer, CustomerAddress, KotRoutingSnapshot, OrderDraft, OrderType, PaymentMethod, Product } from '@/shared/domain';
@@ -316,6 +316,12 @@ async function quickPayment(method: PaymentMethod): Promise<void> {
         paymentMethod: method === 'cash' ? 'نقدي' : 'كي نت',
       });
       await markReceiptPaid(result.orderId, method === 'cash' ? 'نقدي' : 'كي نت');
+    }
+    if (method === 'cash' && settings.settings.printing.cashDrawerEnabled && settings.settings.printing.cashDrawerAutoOpenCash) {
+      await requestCashDrawerOpen(settings.settings, {
+        trigger: 'cash_payment',
+        ...(result.orderId ? { transactionId: result.orderId } : {}),
+      });
     }
     await finishOrder(snapshot, completionMessage);
   } catch (reason) {

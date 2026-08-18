@@ -53,6 +53,7 @@ withDefaults(defineProps<{ name: string; size?: number; strokeWidth?: number }>(
     <template v-else-if="name === 'warning'"><path d="M12 3 2.5 20h19Z"/><path d="M12 9v5m0 3h.01"/></template>
     <template v-else-if="name === 'wifi-off'"><path d="M2 8.8A16 16 0 0 1 5.7 7M8.5 5.2A16 16 0 0 1 22 8.8M5 12.8a11 11 0 0 1 5-2.5m3.5.2a11 11 0 0 1 5.5 2.3M8.5 16.5a5 5 0 0 1 7 0M12 20h.01M3 3l18 18"/></template>
     <template v-else-if="name === 'printer'"><path d="M6 9V3h12v6M6 18H4V9h16v9h-2"/><path d="M6 14h12v7H6z"/></template>
+    <template v-else-if="name === 'lock'"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></template>
     <template v-else><circle cx="12" cy="12" r="9"/></template>
   </svg>
 </template>

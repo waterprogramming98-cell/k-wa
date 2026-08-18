@@ -6,7 +6,8 @@ import { useSettingsStore } from '@/app/stores/settings';
 import { useSyncStore } from '@/app/stores/sync';
 import NotificationCenter from '@/components/NotificationCenter.vue';
 import AppIcon from '@/components/AppIcon.vue';
-import { directPrintQueue } from '@/app/services/direct-printing';
+import { directPrintQueue, requestCashDrawerOpen } from '@/app/services/direct-printing';
+import { loadPrinterDirectory } from '@/app/services/printer-directory';
 
 const route = useRoute();
 const router = useRouter();
@@ -16,6 +17,10 @@ const sync = useSyncStore();
 const pendingPrints = ref(0);
 const moreOpen = ref(false);
 const tabletLandscape = ref(false);
+const drawerOpen = ref(false);
+const drawerReason = ref('');
+const drawerBusy = ref(false);
+const drawerError = ref('');
 
 function updateViewportMode(): void {
   const orientationType = window.screen.orientation?.type ?? '';
@@ -29,7 +34,7 @@ async function loadPendingPrints(): Promise<void> {
 const printQueueChanged = () => { void loadPendingPrints(); };
 onMounted(async () => {
   updateViewportMode();
-  await loadPendingPrints();
+  await Promise.all([loadPendingPrints(), loadPrinterDirectory(navigator.onLine).catch(() => [])]);
   window.addEventListener('kwaiter:print-queue-changed', printQueueChanged);
   window.addEventListener('resize', updateViewportMode);
   window.screen.orientation?.addEventListener('change', updateViewportMode);
@@ -68,6 +73,21 @@ const moreActive = computed(() => moreItems.value.some(item => isActive(item.to)
 
 function isActive(path: string): boolean {
   return path === '/' ? route.path === '/' : route.path.startsWith(path);
+}
+
+async function openCashDrawer(): Promise<void> {
+  if (drawerReason.value.trim().length < 3 || drawerBusy.value) return;
+  drawerBusy.value = true;
+  drawerError.value = '';
+  try {
+    await requestCashDrawerOpen(settings.settings, { trigger: 'manual', reason: drawerReason.value.trim() });
+    drawerReason.value = '';
+    drawerOpen.value = false;
+  } catch (reason) {
+    drawerError.value = reason instanceof Error ? reason.message : 'تعذر فتح درج النقدية';
+  } finally {
+    drawerBusy.value = false;
+  }
 }
 </script>
 
@@ -111,8 +131,19 @@ function isActive(path: string): boolean {
               <span class="more-icon"><AppIcon :name="item.icon" :size="23" /></span>
               <span><strong>{{ item.label }}</strong><small v-if="item.to === '/sync' && (sync.pendingCount || pendingPrints)">{{ sync.pendingCount }} مزامنة · {{ pendingPrints }} طباعة</small></span>
             </RouterLink>
+            <button v-if="auth.permissions.can_open_cash_drawer && settings.settings.printing.cashDrawerEnabled" type="button" class="drawer-action" @click="moreOpen = false; drawerOpen = true">
+              <span class="more-icon"><AppIcon name="cash" :size="23" /></span>
+              <span><strong>فتح درج النقدية</strong><small>يتطلب تسجيل سبب الفتح</small></span>
+            </button>
           </nav>
         </section>
+      </div>
+      <div v-if="drawerOpen" class="modal-backdrop" @click.self="drawerOpen = false">
+        <form class="modal cash-drawer-modal" @submit.prevent="openCashDrawer">
+          <header class="modal-head"><AppIcon name="cash" :size="25" /><h2>فتح درج النقدية</h2><button type="button" class="icon-button" aria-label="إغلاق" @click="drawerOpen = false"><AppIcon name="close" /></button></header>
+          <div class="modal-body stack"><p>اكتب سبب الفتح اليدوي. سيتم تسجيل المستخدم والوقت والطابعة للمراجعة.</p><label class="field"><span>سبب الفتح</span><input v-model.trim="drawerReason" maxlength="255" placeholder="مثال: صرف مبلغ للعميل" autofocus required /></label><p v-if="drawerError" class="error-text">{{ drawerError }}</p></div>
+          <footer class="modal-foot"><button type="button" class="btn btn-secondary" @click="drawerOpen = false">إلغاء</button><button class="btn btn-primary" :disabled="drawerBusy || drawerReason.trim().length < 3">{{ drawerBusy ? 'جاري الفتح…' : 'فتح الدرج' }}</button></footer>
+        </form>
       </div>
     </Teleport>
   </div>

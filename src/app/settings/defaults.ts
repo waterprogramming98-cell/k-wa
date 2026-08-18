@@ -83,6 +83,7 @@ export const DEFAULT_DEVICE_SETTINGS: DeviceSettings = {
     enabled: true,
     mode: 'server',
     receiptCopies: 1,
+    receiptPrinterId: null,
     directHost: '',
     directPort: 9100,
     bluetoothAddress: '',
@@ -91,6 +92,9 @@ export const DEFAULT_DEVICE_SETTINGS: DeviceSettings = {
     cutPaper: true,
     autoPrintOnSave: true,
     autoPrintAfterPayment: true,
+    cashDrawerEnabled: true,
+    cashDrawerPrinterId: null,
+    cashDrawerAutoOpenCash: true,
     connectionTimeoutMs: 5000,
   },
 };
@@ -173,12 +177,14 @@ export function normalizeDeviceSettings(input?: Partial<DeviceSettings> | null):
       ...DEFAULT_DEVICE_SETTINGS.printing,
       ...source.printing,
       receiptCopies: copies,
+      receiptPrinterId: Number(source.printing?.receiptPrinterId) > 0 ? Number(source.printing?.receiptPrinterId) : null,
       paperWidth,
       connectionTimeoutMs,
       directPort,
       directHost: String(source.printing?.directHost ?? '').trim().slice(0, 253),
       bluetoothAddress: String(source.printing?.bluetoothAddress ?? '').trim().toUpperCase().slice(0, 17),
       bluetoothName: String(source.printing?.bluetoothName ?? '').trim().slice(0, 100),
+      cashDrawerPrinterId: Number(source.printing?.cashDrawerPrinterId) > 0 ? Number(source.printing?.cashDrawerPrinterId) : null,
     },
   };
 }

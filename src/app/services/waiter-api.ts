@@ -67,6 +67,7 @@ function mapPrintJobs(input: Array<Record<string, unknown>> = []): ServerPrintJo
     printerPort: Number(job.printer_port ?? 9100),
     paperWidth: (Number(job.paper_width) === 58 ? 58 : 80) as 58 | 80,
     copies: Math.min(3, Math.max(1, Number(job.copies ?? 1))) as 1 | 2 | 3,
+    ...(job.buzzer && typeof job.buzzer === 'object' ? { buzzer: job.buzzer as NonNullable<ServerPrintJob['buzzer']> } : {}),
     payload: (job.payload && typeof job.payload === 'object' ? job.payload : {}) as ServerPrintJob['payload'],
   })).filter(job => job.id > 0);
 }
@@ -270,9 +271,14 @@ export const waiterApi = {
     return response.settings;
   },
 
-  async updateDeviceSettings(settings: unknown): Promise<void> {
+  async unlockDeviceSettings(password: string): Promise<{ unlockToken: string; expiresAt: string }> {
+    if (await isDemo()) return { unlockToken: 'demo-settings-unlock', expiresAt: new Date(Date.now() + 15 * 60_000).toISOString() };
+    return apiClient.post(`${API}/device/settings/unlock`, { password });
+  },
+
+  async updateDeviceSettings(settings: unknown, unlockToken = ''): Promise<void> {
     if (await isDemo()) return;
-    await apiClient.put(`${API}/device/settings`, { settings });
+    await apiClient.put(`${API}/device/settings`, { settings, ...(unlockToken ? { unlockToken } : {}) });
   },
 
   async notifications(cursor?: string): Promise<NotificationSnapshot> {
@@ -327,6 +333,30 @@ export const waiterApi = {
   async testPrinter(printerId: number): Promise<{ jobId: number; printer: string }> {
     if (await isDemo()) return { jobId: Date.now(), printer: 'طابعة تجريبية' };
     return apiClient.post(`${API}/printers/${printerId}/test`, {}, { idempotencyKey: `printer-test-${printerId}-${Date.now()}` });
+  },
+
+  async openCashDrawer(payload: {
+    eventUuid: string;
+    printerId?: number | null;
+    transactionId?: number | null;
+    trigger: 'manual' | 'cash_payment' | 'split_cash' | 'test';
+    reason?: string;
+    direct: boolean;
+  }): Promise<{
+    eventId: number;
+    eventUuid: string;
+    jobId?: number | null;
+    status: string;
+    duplicate?: boolean;
+    printer?: { id: number; name: string; ipAddress: string; port: number; pin: 0 | 1; onMs: number; offMs: number };
+  }> {
+    if (await isDemo()) return { eventId: Date.now(), eventUuid: payload.eventUuid, status: payload.direct ? 'authorized' : 'queued' };
+    return apiClient.post(`${API}/cash-drawer/open`, payload, { idempotencyKey: `drawer-${payload.eventUuid}` });
+  },
+
+  async cashDrawerResult(eventUuid: string, status: 'opened' | 'failed' | 'uncertain', error = ''): Promise<void> {
+    if (await isDemo()) return;
+    await apiClient.post(`${API}/cash-drawer/events/${encodeURIComponent(eventUuid)}`, { status, ...(error ? { error } : {}) });
   },
 
   async printBill(orderId: number, copies = 1, reason?: string, operationKey?: string): Promise<PrintJobResult> {

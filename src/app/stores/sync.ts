@@ -146,6 +146,21 @@ export const useSyncStore = defineStore('sync', () => {
       await waiterApi.printBill(orderId, payload.copies ?? 1, undefined, operation.idempotencyKey);
       return;
     }
+    if (operation.kind === 'cash_drawer.report') {
+      const payload = operation.payload as {
+        eventUuid: string; printerId?: number | null; transactionId?: number | null;
+        trigger: 'manual' | 'cash_payment' | 'split_cash' | 'test'; reason?: string;
+        status: 'opened' | 'failed' | 'uncertain';
+      };
+      await waiterApi.openCashDrawer({
+        eventUuid: payload.eventUuid, trigger: payload.trigger, direct: true,
+        ...(payload.printerId !== undefined ? { printerId: payload.printerId } : {}),
+        ...(payload.transactionId !== undefined ? { transactionId: payload.transactionId } : {}),
+        ...(payload.reason ? { reason: payload.reason } : {}),
+      });
+      await waiterApi.cashDrawerResult(payload.eventUuid, payload.status);
+      return;
+    }
     throw new Error(`عملية المزامنة غير مدعومة: ${operation.kind}`);
   }
 

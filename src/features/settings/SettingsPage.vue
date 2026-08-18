@@ -7,7 +7,7 @@ import { useSettingsStore } from '@/app/stores/settings';
 import { appPreferences } from '@/app/services/preferences';
 import { normalizeDeviceSettings } from '@/app/settings/defaults';
 import { waiterApi } from '@/app/services/waiter-api';
-import { isDirectPrintingMode, pairedBluetoothPrinters, testDirectPrinter, validateDirectPrinter } from '@/app/services/direct-printing';
+import { isDirectPrintingMode, pairedBluetoothPrinters, requestCashDrawerOpen, testDirectPrinter, validateDirectPrinter } from '@/app/services/direct-printing';
 import type { DeviceSettings, Printer } from '@/shared/domain';
 import type { ReceiptSnapshot } from '@/shared/domain';
 import { localDatabase } from '@/app/services/local-database';
@@ -16,6 +16,7 @@ import { receiptHtml } from '@/app/services/receipt';
 import { normalizePaymentOptions, paymentMethodIcon } from '@/shared/payment-methods';
 import AppIcon from '@/components/AppIcon.vue';
 import { setUiLanguage } from '@/app/services/localization';
+import { loadPrinterDirectory } from '@/app/services/printer-directory';
 
 type Tab = 'general' | 'screens' | 'types' | 'pos' | 'payment' | 'tables' | 'notifications' | 'sync' | 'printing';
 const router = useRouter();
@@ -32,7 +33,10 @@ const printerId = ref<number | null>(null);
 const printerMessage = ref('');
 const bluetoothPrinters = ref<Array<{ address: string; name: string }>>([]);
 const bluetoothLoading = ref(false);
-const canManage = computed(() => auth.permissions.can_manage_device);
+const showUnlock = ref(false);
+const managerPassword = ref('');
+const unlocking = ref(false);
+const canManage = computed(() => auth.permissions.can_manage_device || settingsStore.unlocked);
 
 const tabs: Array<{ id: Tab; label: string; icon: string }> = [
   { id: 'general', label: 'عام', icon: 'settings' }, { id: 'screens', label: 'الشاشات', icon: 'home' },
@@ -55,6 +59,8 @@ const typeRows = [
 
 const paymentOptions = computed(() => normalizePaymentOptions(draft.value.payment.knownMethods));
 const enabledPaymentCount = computed(() => paymentOptions.value.filter(option => !draft.value.payment.hiddenMethods.includes(option.id)).length);
+const receiptPrinters = computed(() => printers.value.filter(item => item.active && item.printReceipt));
+const drawerPrinters = computed(() => printers.value.filter(item => item.active && item.cashDrawer?.enabled));
 function paymentEnabled(method: string): boolean { return !draft.value.payment.hiddenMethods.includes(method); }
 function togglePayment(method: string): void {
   const hidden = new Set(draft.value.payment.hiddenMethods);
@@ -77,12 +83,13 @@ watch([tab, () => draft.value.printing.mode], async ([value, mode]) => {
   if (value !== 'printing' || !auth.permissions.can_print) return;
   if (mode === 'bluetooth' && !bluetoothPrinters.value.length) {
     await loadBluetoothPrinters();
-    return;
   }
-  if (mode !== 'server' || printers.value.length) return;
+  if (printers.value.length) return;
   try {
-    printers.value = await waiterApi.printers();
+    printers.value = await loadPrinterDirectory(true);
     printerId.value = printers.value.find(item => item.active)?.id ?? printers.value[0]?.id ?? null;
+    if (!draft.value.printing.receiptPrinterId) draft.value.printing.receiptPrinterId = printers.value.find(item => item.active && item.printReceipt)?.id ?? null;
+    if (!draft.value.printing.cashDrawerPrinterId) draft.value.printing.cashDrawerPrinterId = printers.value.find(item => item.active && item.cashDrawer?.enabled)?.id ?? null;
   } catch (reason) { error.value = reason instanceof Error ? reason.message : 'تعذر تحميل الطابعات'; }
 });
 
@@ -108,6 +115,21 @@ async function save(): Promise<void> {
     await settingsStore.save(draft.value);
     saved.value = true; window.setTimeout(() => { saved.value = false; }, 2500);
   } catch (reason) { error.value = reason instanceof Error ? reason.message : 'تعذر حفظ الإعدادات'; }
+}
+
+async function unlockSettings(): Promise<void> {
+  if (!managerPassword.value || unlocking.value) return;
+  unlocking.value = true;
+  error.value = '';
+  try {
+    await settingsStore.unlock(managerPassword.value);
+    managerPassword.value = '';
+    showUnlock.value = false;
+  } catch (reason) {
+    error.value = reason instanceof Error ? reason.message : 'تعذر فتح الإعدادات';
+  } finally {
+    unlocking.value = false;
+  }
 }
 
 async function testConnection(): Promise<void> { await connectivity.check(); }
@@ -155,6 +177,14 @@ async function testPrinter(): Promise<void> {
   } catch (reason) { error.value = reason instanceof Error ? reason.message : 'فشل اختبار الطابعة'; }
 }
 
+async function testCashDrawer(): Promise<void> {
+  error.value = ''; printerMessage.value = '';
+  try {
+    const result = await requestCashDrawerOpen(draft.value, { trigger: 'test', reason: 'اختبار درج النقدية من إعدادات التابلت' });
+    printerMessage.value = result.queued ? 'تم إرسال أمر اختبار الدرج إلى Print Agent' : 'تم فتح درج النقدية بنجاح';
+  } catch (reason) { error.value = reason instanceof Error ? reason.message : 'تعذر اختبار درج النقدية'; }
+}
+
 async function previewLastReceipt(): Promise<void> {
   const receipt = (await localDatabase.list<ReceiptSnapshot>('receipts')).filter(belongsToActiveScope).sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
   if (!receipt) { error.value = 'لا توجد فاتورة محفوظة للمعاينة بعد'; return; }
@@ -165,6 +195,7 @@ async function previewLastReceipt(): Promise<void> {
 }
 
 async function logout(): Promise<void> {
+  settingsStore.lock();
   await auth.logout();
   await router.replace('/login');
 }
@@ -172,8 +203,9 @@ async function logout(): Promise<void> {
 
 <template>
   <div class="page settings-page">
-    <div class="page-head"><div><h1>إعدادات التابلت</h1><p>تحكم في كل ما يظهر ويعمل على هذا الجهاز فقط</p></div><div class="row"><button class="btn btn-danger" @click="logout">تسجيل الخروج</button><button class="btn btn-secondary" @click="router.push('/health')">صحة الجهاز</button><button class="btn btn-secondary" :disabled="!canManage" @click="resetSettings">إعادة الضبط</button><button class="btn btn-primary" :disabled="!canManage || settingsStore.saving" @click="save">{{ settingsStore.saving ? 'جاري الحفظ…' : saved ? 'تم الحفظ ✓' : 'حفظ الإعدادات' }}</button></div></div>
-    <div v-if="!canManage" class="managed-note">هذه الصفحة للعرض فقط؛ الدور الحالي لا يملك صلاحية إدارة التابلت.</div>
+    <div class="page-head"><div><h1>إعدادات التابلت</h1><p>إعدادات ثابتة لهذا الجهاز لا تتغير عند تبديل المستخدم</p></div><div class="row"><button class="btn btn-danger" @click="logout">تسجيل الخروج</button><button class="btn btn-secondary" @click="router.push('/health')">صحة الجهاز</button><button v-if="!canManage" class="btn btn-primary" @click="showUnlock = true"><AppIcon name="lock" :size="18" /> فتح بواسطة المدير</button><button v-else-if="settingsStore.unlocked" class="btn btn-secondary" @click="settingsStore.lock()"><AppIcon name="lock" :size="18" /> قفل</button><button class="btn btn-secondary" :disabled="!canManage" @click="resetSettings">إعادة الضبط</button><button class="btn btn-primary" :disabled="!canManage || settingsStore.saving" @click="save">{{ settingsStore.saving ? 'جاري الحفظ…' : saved ? 'تم الحفظ ✓' : 'حفظ الإعدادات' }}</button></div></div>
+    <div v-if="!canManage" class="managed-note"><strong>الإعدادات مقفلة للحماية.</strong> يمكن للكاشير أو الجارسون مشاهدة القيم، وللتعديل أدخل كلمة مرور مدير النظام. كلمة المرور لا تُحفظ على التابلت.</div>
+    <div v-else-if="settingsStore.unlocked" class="managed-note success-note">تم فتح الإعدادات مؤقتًا بواسطة مدير النظام. ستظل القيم محفوظة على نفس التابلت لكل المستخدمين.</div>
     <div v-else-if="settingsStore.remotePending" class="managed-note">الإعدادات محفوظة على التابلت وتنتظر المزامنة مع السيرفر عند عودة الاتصال.</div>
     <div class="settings-layout">
       <nav class="settings-nav"><button v-for="item in tabs" :key="item.id" :class="{ active: tab === item.id }" @click="tab = item.id"><AppIcon :name="item.icon" :size="20" />{{ item.label }}</button></nav>
@@ -260,6 +292,15 @@ async function logout(): Promise<void> {
           <label class="switch-row"><span><strong>طباعة تلقائية بعد الدفع</strong><small class="muted">يطبع الفاتورة النهائية بعد نجاح التحصيل الكامل</small></span><input v-model="draft.printing.autoPrintAfterPayment" class="switch" type="checkbox" /></label>
           <div v-if="draft.printing.mode === 'airprint'" class="managed-note">AirPrint لا يحتاج Agent أو إنترنت، لكنه يعرض نافذة اختيار الطابعة والتأكيد على iPad.</div>
           <label class="field"><span>عدد نسخ الفاتورة</span><select v-model.number="draft.printing.receiptCopies"><option :value="1">نسخة واحدة</option><option :value="2">نسختان</option><option :value="3">3 نسخ</option></select></label>
+          <label v-if="receiptPrinters.length" class="field"><span>طابعة الفاتورة الرئيسية</span><select v-model.number="draft.printing.receiptPrinterId"><option :value="null">تلقائي حسب إعداد الفرع</option><option v-for="printer in receiptPrinters" :key="printer.id" :value="printer.id">{{ printer.name }} · {{ printer.department || 'الكل' }} · {{ printer.paperWidth || 80 }}mm</option></select><small class="muted">توجيه KOT للمطبخ والمشروبات يظل مستقلًا حسب قواعد الأقسام.</small></label>
+          <div class="settings-subsection">
+            <h3>درج النقدية وصوت الطابعة</h3>
+            <label class="switch-row"><span><strong>تفعيل درج النقدية على هذا التابلت</strong><small class="muted">الطابعة نفسها يجب أن تكون مفعلة للدرج من إعدادات السيرفر.</small></span><input v-model="draft.printing.cashDrawerEnabled" class="switch" type="checkbox" /></label>
+            <label v-if="drawerPrinters.length" class="field"><span>طابعة درج النقدية</span><select v-model.number="draft.printing.cashDrawerPrinterId"><option :value="null">أول طابعة درج مفعلة</option><option v-for="printer in drawerPrinters" :key="printer.id" :value="printer.id">{{ printer.name }} · {{ printer.connectionType }}</option></select></label>
+            <label class="switch-row"><span><strong>فتح الدرج تلقائيًا مع الدفع النقدي</strong><small class="muted">لا يفتح مع KNET أو إعادة طباعة الفاتورة، وكل عملية فتح تُسجل للمراجعة.</small></span><input v-model="draft.printing.cashDrawerAutoOpenCash" class="switch" type="checkbox" /></label>
+            <div class="managed-note success-note">صوت الطابعة يُضبط لكل طابعة من شاشة طابعات الفرع؛ يمكن تشغيله للمطبخ أو المشروبات أو الفاتورة بصورة مستقلة.</div>
+            <button v-if="auth.permissions.can_open_cash_drawer" class="btn btn-secondary" :disabled="!draft.printing.cashDrawerEnabled" @click="testCashDrawer">اختبار فتح درج النقدية</button>
+          </div>
           <label v-if="draft.printing.mode === 'server' && printers.length" class="field"><span>طابعة الاختبار</span><select v-model.number="printerId"><option v-for="printer in printers" :key="printer.id" :value="printer.id">{{ printer.name }}{{ printer.active ? '' : ' — متوقفة' }}</option></select></label>
           <button class="btn btn-secondary" :disabled="!auth.permissions.can_print || (draft.printing.mode === 'server' && !printerId) || (draft.printing.mode === 'bluetooth' && !draft.printing.bluetoothAddress)" @click="testPrinter">{{ draft.printing.mode === 'tcp' ? 'طباعة اختبار TCP' : draft.printing.mode === 'bluetooth' ? 'طباعة اختبار Bluetooth' : draft.printing.mode === 'server' ? 'اختبار طابعة جهاز الفرع' : 'طريقة اختبار AirPrint' }}</button>
           <button class="btn btn-secondary" @click="previewLastReceipt">معاينة آخر فاتورة</button>
@@ -267,6 +308,13 @@ async function logout(): Promise<void> {
         </section>
         <p v-if="error" class="error-text">{{ error }}</p>
       </fieldset>
+    </div>
+    <div v-if="showUnlock" class="modal-backdrop" @click.self="showUnlock = false">
+      <form class="modal settings-unlock-modal" @submit.prevent="unlockSettings">
+        <header class="modal-head"><AppIcon name="lock" :size="24" /><h2>فتح إعدادات التابلت</h2><button type="button" class="icon-button" aria-label="إغلاق" @click="showUnlock = false">×</button></header>
+        <div class="modal-body stack"><p>أدخل نفس كلمة مرور مدير النظام أو صاحب المنشأة. لن يتم حفظها على الجهاز.</p><label class="field"><span>كلمة مرور المدير</span><input v-model="managerPassword" type="password" autocomplete="current-password" autofocus required /></label><p v-if="error" class="error-text">{{ error }}</p></div>
+        <footer class="modal-foot"><button type="button" class="btn btn-secondary" @click="showUnlock = false">إلغاء</button><button class="btn btn-primary" :disabled="unlocking || !managerPassword">{{ unlocking ? 'جاري التحقق…' : 'فتح الإعدادات' }}</button></footer>
+      </form>
     </div>
   </div>
 </template>

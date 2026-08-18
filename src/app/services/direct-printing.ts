@@ -2,11 +2,13 @@ import { Capacitor, registerPlugin } from '@capacitor/core';
 import { appPreferences } from '@/app/services/preferences';
 import { localDatabase } from '@/app/services/local-database';
 import { receiptFromDraft, renderReceiptRaster } from '@/app/services/receipt';
-import type { DeviceSettings, KotRoutingSnapshot, LocalPrintJob, PrintJobResult, ReceiptSnapshot } from '@/shared/domain';
+import type { DeviceSettings, KotRoutingSnapshot, LocalPrintJob, PrintJobResult, ReceiptSnapshot, SyncOperation } from '@/shared/domain';
 import type { OrderDraft, OrderType, ServerPrintJob } from '@/shared/domain';
 import { belongsToActiveScope, getActiveDataScope, scopedKey } from '@/app/services/data-scope';
 import { waiterApi } from '@/app/services/waiter-api';
 import { getUiLanguage } from '@/app/services/localization';
+import { selectedDrawerPrinter, selectedReceiptPrinter } from '@/app/services/printer-directory';
+import { createId } from '@/shared/ids';
 
 interface DirectPrintPlugin {
   printRaster(options: {
@@ -16,6 +18,10 @@ interface DirectPrintPlugin {
     paperWidth: 58 | 80;
     copies: number;
     cutPaper: boolean;
+    beepEnabled?: boolean;
+    beepMode?: 'bel' | 'esc-b';
+    beepCount?: number;
+    beepDuration?: number;
     imageBase64: string;
   }): Promise<{ bytes: number }>;
   testConnection(options: { host: string; port: number; timeout: number }): Promise<{ success: boolean; error?: string }>;
@@ -26,9 +32,15 @@ interface DirectPrintPlugin {
     paperWidth: 58 | 80;
     copies: number;
     cutPaper: boolean;
+    beepEnabled?: boolean;
+    beepMode?: 'bel' | 'esc-b';
+    beepCount?: number;
+    beepDuration?: number;
     imageBase64: string;
   }): Promise<{ bytes: number }>;
   btTestConnection(options: { address: string }): Promise<{ success: boolean; error?: string }>;
+  openCashDrawer(options: { host: string; port: number; timeout: number; pin: 0 | 1; onMs: number; offMs: number }): Promise<{ bytes: number }>;
+  btOpenCashDrawer(options: { address: string; pin: 0 | 1; onMs: number; offMs: number }): Promise<{ bytes: number }>;
 }
 
 const androidPrinter = registerPlugin<DirectPrintPlugin>('KemetDirectPrint');
@@ -63,7 +75,7 @@ function friendlyError(reason: unknown): string {
 }
 
 async function nativePrint(receipt: ReceiptSnapshot, settings: DeviceSettings['printing'], copies: number, target?: Pick<LocalPrintJob, 'printerHost' | 'printerPort' | 'paperWidth'>): Promise<void> {
-  const printTarget = target as (Pick<LocalPrintJob, 'printerHost' | 'printerPort' | 'paperWidth' | 'printerMode' | 'bluetoothAddress'> | undefined);
+  const printTarget = target as (Pick<LocalPrintJob, 'printerHost' | 'printerPort' | 'paperWidth' | 'printerMode' | 'bluetoothAddress' | 'buzzer'> | undefined);
   const effective = {
     ...settings,
     mode: printTarget?.printerMode || settings.mode,
@@ -81,6 +93,10 @@ async function nativePrint(receipt: ReceiptSnapshot, settings: DeviceSettings['p
       paperWidth: effective.paperWidth,
       copies,
       cutPaper: settings.cutPaper,
+      beepEnabled: printTarget?.buzzer?.enabled ?? false,
+      beepMode: printTarget?.buzzer?.mode ?? 'bel',
+      beepCount: printTarget?.buzzer?.count ?? 1,
+      beepDuration: printTarget?.buzzer?.duration ?? 2,
       imageBase64,
     });
     return;
@@ -92,6 +108,10 @@ async function nativePrint(receipt: ReceiptSnapshot, settings: DeviceSettings['p
     paperWidth: effective.paperWidth,
     copies,
     cutPaper: settings.cutPaper,
+    beepEnabled: printTarget?.buzzer?.enabled ?? false,
+    beepMode: printTarget?.buzzer?.mode ?? 'bel',
+    beepCount: printTarget?.buzzer?.count ?? 1,
+    beepDuration: printTarget?.buzzer?.duration ?? 2,
     imageBase64,
   });
 }
@@ -145,6 +165,7 @@ export const directPrintQueue = {
     if (existing?.status === 'completed') return { jobIds: [], jobs: 1, local: true, queued: false, localJobId: storageId };
     if (existing?.status === 'uncertain' && !force) return { jobIds: [], jobs: 1, local: true, queued: true, localJobId: storageId };
     const settings = await appPreferences.getDeviceSettings();
+    const configuredPrinter = await selectedReceiptPrinter(settings.printing.receiptPrinterId);
     const job: LocalPrintJob = existing ?? {
       scope: getActiveDataScope(),
       id: storageId,
@@ -157,8 +178,9 @@ export const directPrintQueue = {
       printerMode: settings.printing.mode === 'bluetooth' ? 'bluetooth' : 'tcp',
       ...(settings.printing.mode === 'bluetooth'
         ? { bluetoothAddress: settings.printing.bluetoothAddress }
-        : { printerHost: settings.printing.directHost, printerPort: settings.printing.directPort }),
-      paperWidth: settings.printing.paperWidth,
+        : { printerHost: configuredPrinter?.ipAddress || settings.printing.directHost, printerPort: configuredPrinter?.port || settings.printing.directPort }),
+      paperWidth: configuredPrinter?.paperWidth || settings.printing.paperWidth,
+      ...(configuredPrinter ? { printerId: configuredPrinter.id, printerName: configuredPrinter.name, ...(configuredPrinter.buzzer ? { buzzer: configuredPrinter.buzzer } : {}) } : {}),
     };
     if (!existing) await saveJob(job);
     return runJob({ ...job, receipt, copies }, settings, force);
@@ -168,7 +190,7 @@ export const directPrintQueue = {
     receipt: ReceiptSnapshot,
     jobId: string,
     copies: 1 | 2 | 3,
-    target: { printerHost: string; printerPort: number; paperWidth: 58 | 80 },
+    target: { printerHost: string; printerPort: number; paperWidth: 58 | 80; printerId?: number; printerName?: string; buzzer?: LocalPrintJob['buzzer'] },
   ): Promise<PrintJobResult> {
     const storageId = scopedKey(jobId);
     const existing = await localDatabase.get<LocalPrintJob>('printJobs', storageId);
@@ -178,9 +200,18 @@ export const directPrintQueue = {
       scope: getActiveDataScope(), id: storageId, receipt, copies, status: 'pending', attempts: 0,
       nextAttemptAt: Date.now(), createdAt: Date.now(), printerMode: 'tcp',
       printerHost: target.printerHost, printerPort: target.printerPort, paperWidth: target.paperWidth,
+      ...(target.printerId ? { printerId: target.printerId } : {}),
+      ...(target.printerName ? { printerName: target.printerName } : {}),
+      ...(target.buzzer ? { buzzer: target.buzzer } : {}),
     };
     if (!existing) await saveJob(job);
-    return runJob({ ...job, receipt, copies, ...target }, settings, false);
+    return runJob({
+      ...job, receipt, copies,
+      printerHost: target.printerHost, printerPort: target.printerPort, paperWidth: target.paperWidth,
+      ...(target.printerId ? { printerId: target.printerId } : {}),
+      ...(target.printerName ? { printerName: target.printerName } : {}),
+      ...(target.buzzer ? { buzzer: target.buzzer } : {}),
+    }, settings, false);
   },
 
   async flush(force = false): Promise<void> {
@@ -189,8 +220,6 @@ export const directPrintQueue = {
     try {
       const settings = await appPreferences.getDeviceSettings();
       if (!settings.printing.enabled || !isDirectPrintingMode(settings.printing.mode)) return;
-      if (settings.printing.mode === 'tcp' && !settings.printing.directHost) return;
-      if (settings.printing.mode === 'bluetooth' && !settings.printing.bluetoothAddress) return;
       const jobs = (await localDatabase.list<LocalPrintJob>('printJobs')).filter(belongsToActiveScope).sort((a, b) => a.createdAt - b.createdAt);
       for (const job of jobs) {
         if (job.status === 'completed') {
@@ -270,6 +299,8 @@ export const directPrintQueue = {
         scope: getActiveDataScope(), id: storageId, receipt, copies: source.copies, status: 'pending', attempts: 0,
         nextAttemptAt: Date.now(), createdAt: Date.now(), serverJobId: source.id, printerHost: source.printerIp,
         printerPort: source.printerPort, paperWidth: source.paperWidth,
+        printerName: source.printerName,
+        ...(source.buzzer ? { buzzer: source.buzzer } : {}),
         printerMode: settings.printing.mode === 'bluetooth' ? 'bluetooth' : 'tcp',
         ...(settings.printing.mode === 'bluetooth' ? { bluetoothAddress: settings.printing.bluetoothAddress } : {}),
       };
@@ -313,7 +344,7 @@ export const directPrintQueue = {
         receipt,
         `offline-kot-${draft.localId}-${draft.revision}-route-${route.id}`,
         route.copies,
-        { printerHost: route.printer.ipAddress, printerPort: route.printer.port, paperWidth: route.printer.paperWidth },
+        { printerHost: route.printer.ipAddress, printerPort: route.printer.port, paperWidth: route.printer.paperWidth, printerId: route.printer.id, printerName: route.printer.name, ...(route.printer.buzzer ? { buzzer: route.printer.buzzer } : {}) },
       ));
     }
     return results.length ? results : [await this.enqueueDraftKot(draft)];
@@ -381,5 +412,82 @@ export async function testDirectPrinter(settings: DeviceSettings['printing']): P
     temporary: false,
     lines: [{ name: getUiLanguage() === 'en' ? 'Direct Print Test' : 'اختبار الطباعة المباشرة', quantity: 1, unitPrice: 0, total: 0, choices: [getUiLanguage() === 'en' ? 'Connection Successful' : 'الاتصال ناجح'] }],
   };
-  await nativePrint(receipt, settings, 1);
+  const configured = await selectedReceiptPrinter(settings.receiptPrinterId);
+  await nativePrint(receipt, settings, 1, configured ? {
+    printerHost: configured.ipAddress || settings.directHost,
+    printerPort: configured.port || settings.directPort,
+    paperWidth: configured.paperWidth || settings.paperWidth,
+    ...(configured.buzzer ? { buzzer: configured.buzzer } : {}),
+  } as Pick<LocalPrintJob, 'printerHost' | 'printerPort' | 'paperWidth'> : undefined);
+}
+
+function uuid(): string {
+  return globalThis.crypto?.randomUUID?.()
+    ?? 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, token => {
+      const value = Math.floor(Math.random() * 16);
+      return (token === 'x' ? value : (value & 0x3) | 0x8).toString(16);
+    });
+}
+
+export async function requestCashDrawerOpen(
+  settings: DeviceSettings,
+  input: { trigger: 'manual' | 'cash_payment' | 'split_cash' | 'test'; reason?: string; transactionId?: number | null },
+): Promise<{ queued: boolean; eventUuid: string }> {
+  if (!settings.printing.cashDrawerEnabled) throw new Error('فتح درج النقدية متوقف من إعدادات التابلت');
+  const eventUuid = uuid();
+  const direct = isDirectPrintingMode(settings.printing.mode);
+  const configured = await selectedDrawerPrinter(settings.printing.cashDrawerPrinterId);
+  let authorization: Awaited<ReturnType<typeof waiterApi.openCashDrawer>> | null = null;
+
+  if (navigator.onLine) {
+    authorization = await waiterApi.openCashDrawer({
+      eventUuid,
+      printerId: configured?.id ?? settings.printing.cashDrawerPrinterId,
+      trigger: input.trigger,
+      direct,
+      ...(input.transactionId !== undefined ? { transactionId: input.transactionId } : {}),
+      ...(input.reason ? { reason: input.reason } : {}),
+    });
+  } else if (!direct) {
+    throw new Error('فتح الدرج عن طريق Print Agent يحتاج اتصالًا بالسيرفر');
+  }
+
+  if (!direct) return { queued: true, eventUuid };
+
+  const drawer = authorization?.printer
+    ? { pin: authorization.printer.pin, onMs: authorization.printer.onMs, offMs: authorization.printer.offMs }
+    : {
+        pin: configured?.cashDrawer?.pin ?? 0,
+        onMs: configured?.cashDrawer?.onMs ?? 120,
+        offMs: configured?.cashDrawer?.offMs ?? 240,
+      };
+  try {
+    if (settings.printing.mode === 'bluetooth') {
+      if (Capacitor.getPlatform() !== 'android') throw new Error('فتح الدرج عبر Bluetooth متاح على Android فقط');
+      await androidPrinter.btOpenCashDrawer({ address: settings.printing.bluetoothAddress, ...drawer });
+    } else {
+      const host = authorization?.printer?.ipAddress || configured?.ipAddress || settings.printing.directHost;
+      const port = authorization?.printer?.port || configured?.port || settings.printing.directPort;
+      if (!host) throw new Error('لم يتم تحديد IP طابعة درج النقدية');
+      await plugin().openCashDrawer({ host, port, timeout: settings.printing.connectionTimeoutMs, ...drawer });
+    }
+    if (authorization) {
+      await waiterApi.cashDrawerResult(eventUuid, 'opened').catch(() => undefined);
+    } else {
+      const operation: SyncOperation = {
+        scope: getActiveDataScope(), id: createId('sync'), kind: 'cash_drawer.report', aggregateId: eventUuid,
+        idempotencyKey: `cash-drawer:${eventUuid}`, revision: Date.now(),
+        payload: {
+          eventUuid, printerId: configured?.id ?? settings.printing.cashDrawerPrinterId,
+          transactionId: input.transactionId, trigger: input.trigger, reason: input.reason, status: 'opened',
+        },
+        status: 'pending', attempts: 0, nextAttemptAt: Date.now(), createdAt: Date.now(),
+      };
+      await localDatabase.put('syncQueue', operation.id, operation);
+    }
+    return { queued: false, eventUuid };
+  } catch (reason) {
+    if (authorization) await waiterApi.cashDrawerResult(eventUuid, 'failed', friendlyError(reason)).catch(() => undefined);
+    throw reason;
+  }
 }

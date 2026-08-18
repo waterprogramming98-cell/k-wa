@@ -12,6 +12,7 @@ public class KemetAirPrintPlugin: CAPPlugin, CAPBridgedPlugin {
         CAPPluginMethod(name: "print", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "printRaster", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "testConnection", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "openCashDrawer", returnType: CAPPluginReturnPromise),
     ]
 
     @objc func print(_ call: CAPPluginCall) {
@@ -65,9 +66,13 @@ public class KemetAirPrintPlugin: CAPPlugin, CAPBridgedPlugin {
         let paperWidth = call.getInt("paperWidth") == 58 ? 384 : 576
         let copies = min(3, max(1, call.getInt("copies") ?? 1))
         let cutPaper = call.getBool("cutPaper") ?? true
+        let beepEnabled = call.getBool("beepEnabled") ?? false
+        let beepMode = call.getString("beepMode") ?? "bel"
+        let beepCount = min(9, max(1, call.getInt("beepCount") ?? 1))
+        let beepDuration = min(9, max(1, call.getInt("beepDuration") ?? 2))
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                let raster = try self.escPosRaster(cgImage, targetWidth: paperWidth, cutPaper: cutPaper)
+                let raster = try self.escPosRaster(cgImage, targetWidth: paperWidth, cutPaper: cutPaper, beepEnabled: beepEnabled, beepMode: beepMode, beepCount: beepCount, beepDuration: beepDuration)
                 var payload = Data(capacity: raster.count * copies)
                 for _ in 0..<copies { payload.append(raster) }
                 self.connect(endpoint.host, port: endpoint.port, timeoutMs: endpoint.timeout, data: payload) { result in
@@ -80,6 +85,20 @@ public class KemetAirPrintPlugin: CAPPlugin, CAPBridgedPlugin {
                 }
             } catch {
                 call.reject("Direct print failed: \(error.localizedDescription)", "DIRECT_PRINT_FAILED", error)
+            }
+        }
+    }
+
+    @objc func openCashDrawer(_ call: CAPPluginCall) {
+        guard let endpoint = validatedEndpoint(call) else { return }
+        let pin = min(1, max(0, call.getInt("pin") ?? 0))
+        let onMs = min(510, max(20, call.getInt("onMs") ?? 120))
+        let offMs = min(510, max(20, call.getInt("offMs") ?? 240))
+        let command = Data([0x1b, 0x70, UInt8(pin), UInt8(Int(round(Double(onMs) / 2.0))), UInt8(Int(round(Double(offMs) / 2.0)))])
+        connect(endpoint.host, port: endpoint.port, timeoutMs: endpoint.timeout, data: command) { result in
+            switch result {
+            case .success: call.resolve(["bytes": command.count])
+            case .failure(let error): call.reject("Cash drawer command failed: \(error.localizedDescription)", "CASH_DRAWER_FAILED", error)
             }
         }
     }
@@ -149,7 +168,7 @@ public class KemetAirPrintPlugin: CAPPlugin, CAPBridgedPlugin {
         }
     }
 
-    private func escPosRaster(_ source: CGImage, targetWidth: Int, cutPaper: Bool) throws -> Data {
+    private func escPosRaster(_ source: CGImage, targetWidth: Int, cutPaper: Bool, beepEnabled: Bool, beepMode: String, beepCount: Int, beepDuration: Int) throws -> Data {
         let targetHeight = max(1, Int(Double(source.height) * Double(targetWidth) / Double(source.width)))
         guard targetHeight <= 12000 else {
             throw NSError(domain: "KemetDirectPrint", code: 4, userInfo: [NSLocalizedDescriptionKey: "Receipt is too long"])
@@ -197,6 +216,10 @@ public class KemetAirPrintPlugin: CAPPlugin, CAPBridgedPlugin {
         }
         output.append(contentsOf: [0x0a, 0x0a, 0x0a])
         if cutPaper { output.append(contentsOf: [0x1d, 0x56, 0x42, 0x00]) }
+        if beepEnabled {
+            if beepMode.lowercased() == "esc-b" { output.append(contentsOf: [0x1b, 0x42, UInt8(beepCount), UInt8(beepDuration)]) }
+            else { output.append(contentsOf: Array(repeating: UInt8(0x07), count: beepCount)) }
+        }
         return output
     }
 }
